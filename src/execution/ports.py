@@ -6,7 +6,9 @@ continues to build, sign, submit, and confirm transactions unchanged.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from time import monotonic
 from typing import Protocol
 
 from solders.instruction import Instruction
@@ -23,7 +25,7 @@ class AccountSnapshot:
     owner: Pubkey
     lamports: int
     data: bytes
-    slot: int
+    slot: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +36,34 @@ class BlockhashContext:
     last_valid_block_height: int
     observed_slot: int | None = None
     provider_id: str | None = None
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    fetched_mono: float = 0.0
+
+    @classmethod
+    def observed(
+        cls,
+        blockhash: str,
+        last_valid_block_height: int,
+        *,
+        observed_slot: int | None = None,
+        provider_id: str | None = None,
+    ) -> "BlockhashContext":
+        return cls(
+            blockhash=blockhash,
+            last_valid_block_height=last_valid_block_height,
+            observed_slot=observed_slot,
+            provider_id=provider_id,
+            fetched_at=datetime.now(UTC),
+            fetched_mono=monotonic(),
+        )
+
+    def age_seconds(self, now_mono: float | None = None) -> float:
+        if self.fetched_mono <= 0:
+            return 0.0
+        return (monotonic() if now_mono is None else now_mono) - self.fetched_mono
+
+    def is_expired(self, current_block_height: int) -> bool:
+        return current_block_height > self.last_valid_block_height
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,6 +12,9 @@ from typing import Any
 
 from solders.pubkey import Pubkey
 
+from domain.quotes import BuyQuote, ExecutionPlan, ExecutionResult, SellQuote
+from execution.errors import ErrorClassification
+
 # Import from interfaces to avoid duplication
 from interfaces.core import Platform, TokenInfo
 
@@ -26,6 +29,11 @@ class TradeResult:
     error_message: str | None = None
     amount: float | None = None
     price: float | None = None
+    quote: BuyQuote | SellQuote | None = None
+    execution_plan: ExecutionPlan | None = None
+    execution_result: ExecutionResult | None = None
+    error_classification: ErrorClassification | None = None
+    reused_existing_signature: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for logging/serialization.

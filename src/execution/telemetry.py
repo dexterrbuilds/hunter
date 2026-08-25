@@ -20,7 +20,8 @@ def priority_fee_lamports(
     """Calculate the configured maximum priority fee using integer arithmetic."""
     if compute_unit_price_micro_lamports < 0 or compute_unit_limit < 0:
         raise ValueError("compute-unit price and limit must be non-negative")
-    return (compute_unit_price_micro_lamports * compute_unit_limit) // 1_000_000
+    numerator = compute_unit_price_micro_lamports * compute_unit_limit
+    return (numerator + 999_999) // 1_000_000
 
 
 @dataclass(slots=True)

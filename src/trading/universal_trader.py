@@ -6,12 +6,14 @@ Cleaned up to remove all platform-specific hardcoding.
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
 from solders.pubkey import Pubkey
 
+from application.positions import PositionService, SolanaWalletBalanceReader
+from application.risk import RiskLimits, RiskService
 from cleanup.modes import (
     handle_cleanup_after_failure,
     handle_cleanup_after_sell,
@@ -22,13 +24,19 @@ from core.priority_fee.manager import PriorityFeeManager
 from core.pubkeys import (
     WSOL_MINT,
     normalize_quote_mint,
+    quote_decimals,
     resolve_quote_amounts,
     resolve_quote_mint,
 )
 from core.wallet import Wallet
+from domain.lifecycle import ExecutionState, PositionStatus, is_retryable
+from domain.quotes import ExecutionSide
+from execution.errors import ErrorClassification
 from interfaces.core import Platform, TokenInfo
 from monitoring.listener_factory import ListenerFactory
+from monitoring.position_monitor import MonitorRetry, PositionMonitorManager
 from platforms import get_platform_implementations
+from storage.sqlite import SQLitePositionStore
 from trading.base import TradeResult
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller
 from trading.position import Position
@@ -149,6 +157,10 @@ class UniversalTrader:
         compute_units: dict | None = None,
         # Node provider configuration
         max_rps: float = 25.0,
+        # Durable state and bounded orchestration
+        database_path: str = "data/hunter.sqlite3",
+        max_concurrent_positions: int = 4,
+        risk_limits: RiskLimits | None = None,
     ):
         """Initialize the universal trader."""
         # Core components
@@ -161,6 +173,13 @@ class UniversalTrader:
             fixed_fee=fixed_priority_fee,
             extra_fee=extra_priority_fee,
             hard_cap=hard_cap_prior_fee,
+        )
+        self.position_store = SQLitePositionStore(database_path)
+        self.position_service = PositionService(self.position_store)
+        self.risk_service = RiskService(risk_limits)
+        self.max_concurrent_positions = max(1, max_concurrent_positions)
+        self.position_monitor_manager = PositionMonitorManager(
+            self.max_concurrent_positions
         )
 
         # Platform setup
@@ -207,6 +226,9 @@ class UniversalTrader:
                 quote_amounts=self.quote_amounts,
                 curve_refresh_budget=curve_refresh_budget,
                 trust_create_event=trust_create_event,
+                risk_service=self.risk_service,
+                exposure_provider=self._risk_exposure,
+                telemetry_recorder=self._record_telemetry,
             ),
             PlatformAwareSeller(
                 self.solana_client,
@@ -215,6 +237,9 @@ class UniversalTrader:
                 sell_slippage,
                 max_retries,
                 compute_units=self.compute_units,
+                risk_service=self.risk_service,
+                exposure_provider=self._risk_exposure,
+                telemetry_recorder=self._record_telemetry,
             ),
         )
 
@@ -275,7 +300,41 @@ class UniversalTrader:
         self.token_queue: asyncio.Queue = asyncio.Queue()
         self.processing: bool = False
         self.processed_tokens: set[str] = set()
+        self.queued_tokens: set[str] = set()
         self.token_timestamps: dict[str, float] = {}
+        self.active_position_ids: dict[str, str] = {
+            str(item.accounting.token_mint): item.accounting.position_id
+            for item in self.position_service.list_positions()
+            if item.accounting.status != PositionStatus.CLOSED
+        }
+        self.pending_sell_signatures: dict[str, str] = {}
+
+    async def _risk_exposure(
+        self, token_mint: Pubkey, quote_mint: Pubkey
+    ) -> tuple[int, int]:
+        """Return current/aggregate raw quote cost basis for risk guards."""
+        existing = 0
+        aggregate = 0
+        for position in self.position_service.list_positions():
+            accounting = position.accounting
+            if (
+                accounting.status == PositionStatus.CLOSED
+                or accounting.quote_mint != quote_mint
+            ):
+                continue
+            aggregate += accounting.remaining_cost_basis_raw
+            if accounting.token_mint == token_mint:
+                existing += accounting.remaining_cost_basis_raw
+        return existing, aggregate
+
+    def _record_telemetry(self, telemetry) -> None:
+        """Persist completed RPC telemetry after the confirmation hot path."""
+        try:
+            execution = self.position_store.get_execution(telemetry.execution_id)
+            attempt = execution.submission_attempt if execution is not None else 1
+            self.position_store.save_telemetry(telemetry, attempt=max(1, attempt))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to persist execution telemetry")
 
     async def start(self) -> None:
         """Start the trading bot and listen for new tokens."""
@@ -310,6 +369,9 @@ class UniversalTrader:
         except Exception as e:
             logger.warning(f"RPC warm-up failed: {e!s}")
 
+        await self.position_monitor_manager.start()
+        await self._recover_positions()
+
         try:
             # Choose operating mode based on yolo_mode
             if not self.yolo_mode:
@@ -330,7 +392,12 @@ class UniversalTrader:
                 logger.info(
                     "Running in continuous mode - will process tokens until interrupted"
                 )
-                processor_task = asyncio.create_task(self._process_token_queue())
+                processor_tasks = [
+                    asyncio.create_task(
+                        self._process_token_queue(), name=f"hunter-worker-{index}"
+                    )
+                    for index in range(self.max_concurrent_positions)
+                ]
 
                 try:
                     await self.token_listener.listen_for_tokens(
@@ -341,11 +408,9 @@ class UniversalTrader:
                 except Exception:
                     logger.exception("Token listening stopped due to error")
                 finally:
-                    processor_task.cancel()
-                    try:
-                        await processor_task
-                    except asyncio.CancelledError:
-                        pass
+                    for processor_task in processor_tasks:
+                        processor_task.cancel()
+                    await asyncio.gather(*processor_tasks, return_exceptions=True)
 
         except Exception:
             logger.exception("Trading stopped due to error")
@@ -427,20 +492,244 @@ class UniversalTrader:
         for key in old_keys:
             self.token_timestamps.pop(key, None)
 
+        await self.position_monitor_manager.stop()
         await self.solana_client.close()
+        self.position_store.close()
+
+    async def _recover_positions(self) -> None:
+        """Reconcile persisted inventory before any new token is traded."""
+        open_positions = [
+            item
+            for item in self.position_service.list_positions()
+            if item.accounting.status != PositionStatus.CLOSED
+        ]
+        if not open_positions:
+            return
+        await self._reconcile_pending_sell_executions(open_positions)
+        report = await self.position_service.recover(
+            owner=self.wallet.pubkey,
+            balance_reader=SolanaWalletBalanceReader(self.solana_client),
+        )
+        logger.info(
+            f"Recovered {len(report.eligible_position_ids)} eligible position(s); "
+            f"{len(report.issues)} require reconciliation"
+        )
+        for issue in report.issues:
+            logger.warning(
+                f"Position {issue.position_id} requires reconciliation: {issue.reason}"
+            )
+        for position_id in report.eligible_position_ids:
+            stored = self.position_service.get_position(position_id)
+            token_info = self._token_info_from_metadata(stored.strategy_metadata)
+            if token_info is None:
+                self.position_store.mark_reconciliation_required(
+                    position_id, "persisted token execution metadata is incomplete"
+                )
+                continue
+            accounting = stored.accounting
+            quantity = accounting.remaining_quantity_raw / 10**accounting.token_decimals
+            if quantity <= 0:
+                self.position_store.mark_reconciliation_required(
+                    position_id, "persisted open position has zero inventory"
+                )
+                continue
+            quote_cost = (
+                accounting.remaining_cost_basis_raw / 10**accounting.quote_decimals
+            )
+            entry_price = quote_cost / quantity
+
+            async def resume(
+                info: TokenInfo = token_info,
+                amount: float = quantity,
+                price: float = entry_price,
+            ) -> None:
+                recovered_result = TradeResult(
+                    success=True,
+                    platform=info.platform,
+                    amount=amount,
+                    price=price,
+                )
+                if self.exit_strategy == "tp_sl":
+                    await self._handle_tp_sl_exit(info, recovered_result)
+                elif self.exit_strategy == "time_based":
+                    await self._handle_time_based_exit(info, recovered_result)
+
+            await self.position_monitor_manager.submit(position_id, resume)
+
+    async def _reconcile_pending_sell_executions(self, positions: list) -> None:
+        """Inspect persisted sell signatures before wallet reconciliation.
+
+        A restart must never turn an accepted-but-unobserved sell into a new
+        economically equivalent transaction. Confirmed signatures are applied
+        from transaction effects; expired signatures may become retryable; all
+        ambiguous states require operator reconciliation.
+        """
+        for stored in positions:
+            accounting = stored.accounting
+            if accounting.status not in {
+                PositionStatus.SELL_SUBMITTED,
+                PositionStatus.SELL_FAILED_RETRYABLE,
+            }:
+                continue
+            execution = self.position_store.get_latest_execution(
+                accounting.position_id, side="sell"
+            )
+            if execution is None or execution.signature is None:
+                self.position_store.mark_reconciliation_required(
+                    accounting.position_id,
+                    "restart found a pending sell without persisted transaction identity",
+                )
+                continue
+            try:
+                observation = await self.solana_client.observe_transaction(
+                    execution.signature,
+                    last_valid_block_height=execution.last_valid_block_height,
+                )
+            except Exception as error:  # noqa: BLE001
+                self.position_store.mark_reconciliation_required(
+                    accounting.position_id,
+                    f"persisted sell inspection failed: {type(error).__name__}",
+                )
+                continue
+            self.position_store.update_execution(
+                execution.logical_execution_id,
+                state=observation.state,
+                error_classification=observation.error_classification,
+            )
+            if observation.succeeded:
+                try:
+                    result = await self.solana_client.get_execution_effects(
+                        logical_execution_id=execution.logical_execution_id,
+                        side=ExecutionSide.SELL,
+                        signature=execution.signature,
+                        user=self.wallet.pubkey,
+                        token_mint=accounting.token_mint,
+                        quote_mint=accounting.quote_mint,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    self.position_store.mark_reconciliation_required(
+                        accounting.position_id,
+                        "confirmed sell effects could not be reconstructed: "
+                        f"{type(error).__name__}",
+                    )
+                    continue
+                current = self.position_service.get_position(
+                    accounting.position_id
+                ).accounting.status
+                if current == PositionStatus.SELL_FAILED_RETRYABLE:
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.EXIT_REQUESTED,
+                        "restart resumed persisted sell identity",
+                    )
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.SELL_SUBMITTED,
+                        execution.logical_execution_id,
+                    )
+                    current = PositionStatus.SELL_SUBMITTED
+                if current != PositionStatus.SELL_CONFIRMED:
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.SELL_CONFIRMED,
+                        execution.signature,
+                    )
+                self.position_service.apply_sell_execution(
+                    accounting.position_id, result
+                )
+                if (
+                    self.position_service.get_position(
+                        accounting.position_id
+                    ).accounting.status
+                    == PositionStatus.CLOSED
+                ):
+                    self.active_position_ids.pop(str(accounting.token_mint), None)
+            elif observation.state == ExecutionState.EXPIRED:
+                current = self.position_service.get_position(
+                    accounting.position_id
+                ).accounting.status
+                if current == PositionStatus.SELL_SUBMITTED:
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.SELL_FAILED_RETRYABLE,
+                        ErrorClassification.BLOCKHASH_EXPIRED.value,
+                    )
+            elif observation.state == ExecutionState.FAILED_ON_CHAIN:
+                current = self.position_service.get_position(
+                    accounting.position_id
+                ).accounting.status
+                if current == PositionStatus.SELL_FAILED_RETRYABLE:
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.EXIT_REQUESTED,
+                        "restart inspected prior sell signature",
+                    )
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.SELL_SUBMITTED,
+                        execution.logical_execution_id,
+                    )
+                    current = PositionStatus.SELL_SUBMITTED
+                if current == PositionStatus.SELL_SUBMITTED:
+                    self.position_store.transition_position(
+                        accounting.position_id,
+                        PositionStatus.SELL_FAILED_PERMANENT,
+                        ErrorClassification.ON_CHAIN_PROGRAM_FAILURE.value,
+                    )
+            else:
+                self.position_store.mark_reconciliation_required(
+                    accounting.position_id,
+                    "persisted sell signature remains accepted but not conclusively observed",
+                )
+
+    @staticmethod
+    def _token_info_from_metadata(metadata: dict) -> TokenInfo | None:
+        token = metadata.get("token_info")
+        if not isinstance(token, dict):
+            return None
+        try:
+            optional_pubkey = lambda value: (  # noqa: E731
+                Pubkey.from_string(value) if value else None
+            )
+            return TokenInfo(
+                name=token.get("name", token.get("symbol", "unknown")),
+                symbol=token.get("symbol", "unknown"),
+                uri=token.get("uri", ""),
+                mint=Pubkey.from_string(token["mint"]),
+                platform=Platform(token["platform"]),
+                bonding_curve=optional_pubkey(token.get("bonding_curve")),
+                associated_bonding_curve=optional_pubkey(
+                    token.get("associated_bonding_curve")
+                ),
+                pool_state=optional_pubkey(token.get("pool_state")),
+                base_vault=optional_pubkey(token.get("base_vault")),
+                quote_vault=optional_pubkey(token.get("quote_vault")),
+                creator=optional_pubkey(token.get("creator")),
+                creator_vault=optional_pubkey(token.get("creator_vault")),
+                token_program_id=optional_pubkey(token.get("token_program_id")),
+                quote_mint=optional_pubkey(token.get("quote_mint")),
+                is_mayhem_mode=bool(token.get("is_mayhem_mode", False)),
+                is_cashback_coin=bool(token.get("is_cashback_coin", False)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def _queue_token(self, token_info: TokenInfo) -> None:
         """Queue a token for processing if not already processed."""
         token_key = str(token_info.mint)
 
-        if token_key in self.processed_tokens:
+        if token_key in self.processed_tokens or token_key in self.queued_tokens:
             logger.debug(f"Token {token_info.symbol} already processed. Skipping...")
             return
 
         # Record timestamp when token was discovered
         self.token_timestamps[token_key] = monotonic()
-
-        await self.token_queue.put(token_info)
+        self.queued_tokens.add(token_key)
+        try:
+            await self.token_queue.put(token_info)
+        except BaseException:
+            self.queued_tokens.discard(token_key)
+            raise
         logger.info(
             f"Queued new token: {token_info.symbol} ({token_info.mint}) on {token_info.platform.value}"
         )
@@ -448,9 +737,13 @@ class UniversalTrader:
     async def _process_token_queue(self) -> None:
         """Continuously process tokens from the queue, only if they're fresh."""
         while True:
+            received_item = False
             try:
                 token_info = await self.token_queue.get()
+                received_item = True
                 token_key = str(token_info.mint)
+                self.processed_tokens.add(token_key)
+                self.queued_tokens.discard(token_key)
 
                 # Check if token is still "fresh"
                 current_time = monotonic()
@@ -464,8 +757,6 @@ class UniversalTrader:
                     )
                     continue
 
-                self.processed_tokens.add(token_key)
-
                 logger.info(
                     f"Processing fresh token: {token_info.symbol} (age: {token_age:.1f}s)"
                 )
@@ -477,7 +768,8 @@ class UniversalTrader:
             except Exception:
                 logger.exception("Error in token queue processor")
             finally:
-                self.token_queue.task_done()
+                if received_item:
+                    self.token_queue.task_done()
 
     async def _handle_token(self, token_info: TokenInfo) -> None:
         """Handle a new token creation event."""
@@ -522,7 +814,7 @@ class UniversalTrader:
                 f"{token_quote_mint} worth of {token_info.symbol} "
                 f"on {token_info.platform.value}..."
             )
-            buy_result: TradeResult = await self.buyer.execute(token_info)
+            buy_result: TradeResult = await self._execute_managed_buy(token_info)
 
             if buy_result.success:
                 await self._handle_successful_buy(token_info, buy_result)
@@ -539,6 +831,56 @@ class UniversalTrader:
         except Exception:
             logger.exception(f"Error handling token {token_info.symbol}")
 
+    async def _execute_managed_buy(self, token_info: TokenInfo) -> TradeResult:
+        """Persist logical buy identity before waiting for confirmation."""
+        if not hasattr(self, "position_store"):
+            return await self.buyer.execute(token_info)
+        logical_execution_id = f"buy:{token_info.mint}"
+        execution = self.position_store.create_execution(
+            logical_execution_id, position_id=None, side="buy"
+        )
+
+        def record_submission(signature, blockhash_context) -> None:
+            self.position_store.update_execution(
+                logical_execution_id,
+                state=ExecutionState.SIGNATURE_RECEIVED,
+                signature=str(signature),
+                blockhash=(blockhash_context.blockhash if blockhash_context else None),
+                last_valid_block_height=(
+                    blockhash_context.last_valid_block_height
+                    if blockhash_context
+                    else None
+                ),
+                increment_attempt=True,
+            )
+
+        result = await self.buyer.execute(
+            token_info,
+            existing_signature=execution.signature,
+            existing_last_valid_block_height=execution.last_valid_block_height,
+            logical_execution_id=logical_execution_id,
+            submission_recorder=record_submission,
+        )
+        if result.success:
+            self.position_store.update_execution(
+                logical_execution_id, state=ExecutionState.CONFIRMED
+            )
+        else:
+            observation = getattr(
+                self.solana_client, "last_transaction_observation", None
+            )
+            if observation is not None and (
+                execution.signature is not None or result.tx_signature is not None
+            ):
+                self.position_store.update_execution(
+                    logical_execution_id,
+                    state=observation.state,
+                    error_classification=(
+                        result.error_classification or observation.error_classification
+                    ),
+                )
+        return result
+
     async def _handle_successful_buy(
         self, token_info: TokenInfo, buy_result: TradeResult
     ) -> None:
@@ -546,6 +888,8 @@ class UniversalTrader:
         logger.info(
             f"Successfully bought {token_info.symbol} on {token_info.platform.value}"
         )
+        if not buy_result.reused_existing_signature:
+            self.risk_service.record_trade()
         self._log_trade(
             "buy",
             token_info,
@@ -559,16 +903,101 @@ class UniversalTrader:
         if token_info.token_program_id:
             self.traded_token_programs[mint_str] = token_info.token_program_id
 
-        # Choose exit strategy
-        if not self.marry_mode:
+        buy_execution_id = (
+            buy_result.execution_plan.logical_execution_id
+            if buy_result.execution_plan is not None
+            else f"buy:{token_info.mint}"
+        )
+        buy_execution = self.position_store.get_execution(buy_execution_id)
+        if buy_result.execution_result is not None:
+            existing_position_id = (
+                buy_execution.position_id
+                if buy_execution is not None and buy_execution.position_id
+                else self.active_position_ids.get(mint_str)
+            )
+            if buy_result.reused_existing_signature and existing_position_id:
+                stored = self.position_service.get_position(existing_position_id)
+            else:
+                stored = self.position_service.open_from_execution(
+                    buy_result.execution_result,
+                    token_mint=token_info.mint,
+                    quote_mint=normalize_quote_mint(token_info.quote_mint),
+                    token_decimals=6,
+                    quote_decimals=quote_decimals(
+                        normalize_quote_mint(token_info.quote_mint)
+                    ),
+                    strategy_metadata={
+                        "symbol": token_info.symbol,
+                        "platform": token_info.platform.value,
+                        "exit_strategy": self.exit_strategy,
+                        "token_info": self._serialize_token_info(token_info),
+                    },
+                )
+                self.active_position_ids[mint_str] = stored.accounting.position_id
+            if buy_execution is not None and buy_execution.position_id is None:
+                self.position_store.attach_execution_position(
+                    buy_execution_id,
+                    stored.accounting.position_id,
+                )
+            if stored.accounting.status == PositionStatus.CLOSED:
+                logger.info(
+                    f"Ignoring replay of completed buy {buy_result.tx_signature}; "
+                    "its persisted position is already closed"
+                )
+                return
+            self.active_position_ids[mint_str] = stored.accounting.position_id
+        else:
+            logger.warning(
+                f"Buy {buy_result.tx_signature} has no structured execution effects; "
+                "the position cannot be safely persisted"
+            )
+
+        # Choose exit strategy. Continuous detection submits the monitor to a
+        # bounded independent worker pool; single-token mode keeps its original
+        # wait-until-exit behavior.
+        async def monitor_exit() -> None:
             if self.exit_strategy == "tp_sl":
                 await self._handle_tp_sl_exit(token_info, buy_result)
             elif self.exit_strategy == "time_based":
                 await self._handle_time_based_exit(token_info, buy_result)
+
+        if not self.marry_mode:
+            if self.exit_strategy in {"tp_sl", "time_based"}:
+                position_id = self.active_position_ids.get(mint_str, mint_str)
+                if self.yolo_mode:
+                    await self.position_monitor_manager.submit(
+                        position_id, monitor_exit
+                    )
+                else:
+                    await monitor_exit()
             elif self.exit_strategy == "manual":
                 logger.info("Manual exit strategy - position will remain open")
         else:
             logger.info("Marry mode enabled. Skipping sell operation.")
+
+    @staticmethod
+    def _serialize_token_info(token_info: TokenInfo) -> dict[str, object]:
+        def text(value: Pubkey | None) -> str | None:
+            return str(value) if value is not None else None
+
+        return {
+            "name": token_info.name,
+            "symbol": token_info.symbol,
+            "uri": token_info.uri,
+            "mint": str(token_info.mint),
+            "platform": token_info.platform.value,
+            "bonding_curve": text(token_info.bonding_curve),
+            "associated_bonding_curve": text(token_info.associated_bonding_curve),
+            "pool_state": text(token_info.pool_state),
+            "base_vault": text(token_info.base_vault),
+            "quote_vault": text(token_info.quote_vault),
+            "creator": text(token_info.creator),
+            "creator_vault": text(token_info.creator_vault),
+            "token_program_id": text(token_info.token_program_id),
+            "quote_mint": str(normalize_quote_mint(token_info.quote_mint)),
+            "is_mayhem_mode": token_info.is_mayhem_mode,
+            "is_cashback_coin": token_info.is_cashback_coin,
+        }
 
     async def _handle_failed_buy(
         self, token_info: TokenInfo, buy_result: TradeResult
@@ -625,34 +1054,46 @@ class UniversalTrader:
 
         logger.info(f"Selling {token_info.symbol}...")
         # Pass token amount and price from buy result to avoid RPC delays
-        sell_result: TradeResult = await self.seller.execute(
-            token_info, token_amount=buy_result.amount, token_price=buy_result.price
-        )
-
-        if sell_result.success:
-            logger.info(f"Successfully sold {token_info.symbol}")
-            self._log_trade(
-                "sell",
+        while True:
+            sell_result = await self._execute_managed_sell(
                 token_info,
-                sell_result.price,
-                sell_result.amount,
-                sell_result.tx_signature,
+                token_amount=buy_result.amount,
+                token_price=buy_result.price,
             )
-            # Close ATA if enabled
-            await handle_cleanup_after_sell(
-                self.solana_client,
-                self.wallet,
-                token_info.mint,
-                token_info.token_program_id,
-                self.priority_fee_manager,
-                self.cleanup_mode,
-                self.cleanup_with_priority_fee,
-                self.cleanup_force_close_with_burn,
-            )
-        else:
+
+            if sell_result.success:
+                logger.info(f"Successfully sold {token_info.symbol}")
+                self._log_trade(
+                    "sell",
+                    token_info,
+                    sell_result.price,
+                    sell_result.amount,
+                    sell_result.tx_signature,
+                )
+                await handle_cleanup_after_sell(
+                    self.solana_client,
+                    self.wallet,
+                    token_info.mint,
+                    token_info.token_program_id,
+                    self.priority_fee_manager,
+                    self.cleanup_mode,
+                    self.cleanup_with_priority_fee,
+                    self.cleanup_force_close_with_burn,
+                )
+                return
+
             logger.error(
                 f"Failed to sell {token_info.symbol}: {sell_result.error_message}"
             )
+            if sell_result.error_classification is not None and not is_retryable(
+                sell_result.error_classification
+            ):
+                logger.error(
+                    f"Sell for {token_info.symbol} entered an explicit permanent "
+                    f"failure state: {sell_result.error_classification.value}"
+                )
+                return
+            await asyncio.sleep(self.price_check_interval)
 
     async def _monitor_position_until_exit(
         self, token_info: TokenInfo, position: Position
@@ -691,7 +1132,7 @@ class UniversalTrader:
                     # moved away from entry. current_price cost no extra RPC
                     # call — it was fetched at the top of this iteration.
                     exit_sell_attempts += 1
-                    sell_result = await self.seller.execute(
+                    sell_result = await self._execute_managed_sell(
                         token_info,
                         token_amount=position.quantity,
                         token_price=current_price,
@@ -736,12 +1177,28 @@ class UniversalTrader:
                         f"{exit_sell_attempts}/{self.max_exit_sell_attempts}): "
                         f"{sell_result.error_message}"
                     )
+                    if (
+                        sell_result.error_classification is not None
+                        and not is_retryable(sell_result.error_classification)
+                    ):
+                        logger.error(
+                            f"Position {token_info.symbol} is persisted in "
+                            "SELL_FAILED_PERMANENT and requires operator review"
+                        )
+                        break
                     if exit_sell_attempts >= self.max_exit_sell_attempts:
                         logger.error(
-                            f"Giving up on exiting {token_info.symbol} after "
-                            f"{exit_sell_attempts} attempts. Position stays open "
-                            f"and is no longer monitored - tokens are still held."
+                            f"Exit attempts reached {exit_sell_attempts} for "
+                            f"{token_info.symbol}; monitoring remains active and "
+                            "will continue after the next state/price check"
                         )
+                        # The legacy loop remains bounded, but production
+                        # monitors are durably requeued by the fixed worker
+                        # pool instead of being forgotten.
+                        if hasattr(self, "position_monitor_manager") and str(
+                            token_info.mint
+                        ) in getattr(self, "active_position_ids", {}):
+                            raise MonitorRetry(self.price_check_interval)
                         break
                     # Keep monitoring: the next iteration re-reads the price and
                     # retries the sell with a floor that matches the market.
@@ -756,11 +1213,147 @@ class UniversalTrader:
                 # Wait before next price check
                 await asyncio.sleep(self.price_check_interval)
 
+            except MonitorRetry:
+                raise
             except Exception:
                 logger.exception("Error monitoring position")
                 await asyncio.sleep(
                     self.price_check_interval
                 )  # Continue monitoring despite errors
+
+    async def _execute_managed_sell(
+        self, token_info: TokenInfo, *, token_amount: float, token_price: float
+    ) -> TradeResult:
+        """Persist sell lifecycle and inspect ambiguous signatures before retry."""
+        if not hasattr(self, "active_position_ids"):
+            # Offline Milestone 1 verification harnesses construct a minimal
+            # coordinator without persistence; preserve their call contract.
+            return await self.seller.execute(
+                token_info, token_amount=token_amount, token_price=token_price
+            )
+        mint_key = str(token_info.mint)
+        position_id = self.active_position_ids.get(mint_key)
+        logical_execution_id = None
+        pending_execution = None
+        if position_id is not None:
+            stored = self.position_service.get_position(position_id)
+            pending_execution = self.position_store.get_pending_execution(
+                position_id, side="sell"
+            )
+            logical_execution_id = (
+                pending_execution.logical_execution_id
+                if pending_execution is not None
+                else f"sell:{position_id}:{stored.accounting.sold_quantity_raw}"
+            )
+            pending_execution = self.position_store.create_execution(
+                logical_execution_id, position_id=position_id, side="sell"
+            )
+            status = stored.accounting.status
+            if status == PositionStatus.SELL_FAILED_PERMANENT:
+                return TradeResult(
+                    success=False,
+                    platform=token_info.platform,
+                    error_message="Position sell is in permanent-failure state",
+                    error_classification=ErrorClassification.ON_CHAIN_PROGRAM_FAILURE,
+                )
+            if status in {PositionStatus.OPEN, PositionStatus.SELL_FAILED_RETRYABLE}:
+                self.position_store.transition_position(
+                    position_id,
+                    PositionStatus.EXIT_REQUESTED,
+                    "exit strategy requested sell",
+                )
+                status = PositionStatus.EXIT_REQUESTED
+            if status == PositionStatus.EXIT_REQUESTED:
+                self.position_store.transition_position(
+                    position_id,
+                    PositionStatus.SELL_SUBMITTED,
+                    "sell construction/submission started",
+                )
+
+        def record_submission(signature, blockhash_context) -> None:
+            if logical_execution_id is None:
+                return
+            self.position_store.update_execution(
+                logical_execution_id,
+                state=ExecutionState.SIGNATURE_RECEIVED,
+                signature=str(signature),
+                blockhash=(blockhash_context.blockhash if blockhash_context else None),
+                last_valid_block_height=(
+                    blockhash_context.last_valid_block_height
+                    if blockhash_context
+                    else None
+                ),
+                increment_attempt=True,
+            )
+
+        result = await self.seller.execute(
+            token_info,
+            token_amount=token_amount,
+            token_price=token_price,
+            existing_signature=(
+                pending_execution.signature if pending_execution else None
+            ),
+            existing_last_valid_block_height=(
+                pending_execution.last_valid_block_height if pending_execution else None
+            ),
+            logical_execution_id=logical_execution_id,
+            submission_recorder=(record_submission if position_id else None),
+        )
+        if result.tx_signature:
+            self.pending_sell_signatures[mint_key] = str(result.tx_signature)
+
+        if position_id is None:
+            return result
+        if result.success and result.execution_result is not None:
+            self.risk_service.record_trade()
+            if logical_execution_id is not None:
+                self.position_store.update_execution(
+                    logical_execution_id, state=ExecutionState.CONFIRMED
+                )
+            current = self.position_service.get_position(position_id)
+            if current.accounting.status == PositionStatus.SELL_SUBMITTED:
+                self.position_store.transition_position(
+                    position_id,
+                    PositionStatus.SELL_CONFIRMED,
+                    str(result.tx_signature),
+                )
+            self.position_service.apply_sell_execution(
+                position_id, result.execution_result
+            )
+            self.pending_sell_signatures.pop(mint_key, None)
+            if (
+                self.position_service.get_position(position_id).accounting.status
+                == PositionStatus.CLOSED
+            ):
+                self.active_position_ids.pop(mint_key, None)
+            return result
+
+        classification = result.error_classification or ErrorClassification.UNKNOWN
+        if logical_execution_id is not None:
+            observation = getattr(
+                self.solana_client, "last_transaction_observation", None
+            )
+            execution_state = (
+                observation.state
+                if observation is not None
+                else ExecutionState.TIMED_OUT
+            )
+            self.position_store.update_execution(
+                logical_execution_id,
+                state=execution_state,
+                error_classification=classification,
+            )
+        current = self.position_service.get_position(position_id)
+        if current.accounting.status == PositionStatus.SELL_SUBMITTED:
+            target = (
+                PositionStatus.SELL_FAILED_RETRYABLE
+                if is_retryable(classification)
+                else PositionStatus.SELL_FAILED_PERMANENT
+            )
+            self.position_store.transition_position(
+                position_id, target, classification.value
+            )
+        return result
 
     def _get_pool_address(self, token_info: TokenInfo) -> Pubkey:
         """Get the pool/curve address for price monitoring using platform-agnostic method."""
@@ -828,7 +1421,7 @@ class UniversalTrader:
             trades_dir.mkdir(exist_ok=True)
 
             log_entry = {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "action": action,
                 "platform": token_info.platform.value,
                 "token_address": str(token_info.mint),

@@ -4,10 +4,13 @@ Final cleanup removing all platform-specific hardcoding.
 """
 
 import asyncio
+from decimal import ROUND_DOWN, Decimal
 from time import monotonic
+from typing import Awaitable, Callable
 
 from solders.pubkey import Pubkey
 
+from application.risk import FeeExposure, RiskContext, RiskService
 from core.client import SolanaClient
 from core.priority_fee.manager import PriorityFeeManager
 from core.pubkeys import (
@@ -19,12 +22,35 @@ from core.pubkeys import (
     quote_units_per_token,
 )
 from core.wallet import Wallet
+from domain.amounts import (
+    BasisPoints,
+    Lamports,
+    MicroLamportsPerCU,
+    QuoteAmountRaw,
+    RoundingDirection,
+    TokenAmountRaw,
+    priority_fee_lamports_ceiling,
+)
+from domain.lifecycle import ExecutionState
+from domain.quotes import ExecutionPlan, ExecutionSide, quote_buy, quote_sell
+from execution.errors import ErrorClassification
+from execution.telemetry import ExecutionTelemetry
 from interfaces.core import AddressProvider, Platform, TokenInfo
 from platforms import get_platform_implementations
 from trading.base import Trader, TradeResult
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+ExposureProvider = Callable[[Pubkey, Pubkey], Awaitable[tuple[int, int]]]
+TelemetryRecorder = Callable[[ExecutionTelemetry], None]
+SubmissionRecorder = Callable[[object, object | None], None]
+
+
+def _fraction_to_basis_points(value: float) -> BasisPoints:
+    """Convert a legacy decimal fraction to bps with explicit truncation."""
+    decimal_bps = Decimal(str(value)) * Decimal(10_000)
+    return BasisPoints(int(decimal_bps.to_integral_value(rounding=ROUND_DOWN)))
 
 
 def _quote_symbol(quote_mint: Pubkey) -> str:
@@ -103,6 +129,33 @@ async def _read_pool_state_with_retry(
     raise last_error or RuntimeError("pool_state unavailable after retries")
 
 
+async def _read_pool_and_fees_with_retry(
+    curve_manager: object,
+    pool_address: Pubkey,
+    budget_seconds: float = 2.0,
+    delay_seconds: float = 0.15,
+) -> tuple[dict, object]:
+    """Read Pump curve and fee state from one RPC context with bounded retry."""
+    deadline = monotonic() + budget_seconds
+    last_error: Exception | None = None
+    while True:
+        try:
+            try:
+                return await curve_manager.get_pool_state_and_fee_schedule(
+                    pool_address, commitment="processed"
+                )
+            except TypeError:
+                # Milestone 1 test doubles and compatible third-party curve
+                # managers may expose the older one-argument contract.
+                return await curve_manager.get_pool_state_and_fee_schedule(pool_address)
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+            if monotonic() + delay_seconds > deadline:
+                break
+            await asyncio.sleep(delay_seconds)
+    raise last_error or RuntimeError("Pump curve/fee state unavailable after retries")
+
+
 def _refresh_quote_mint(token_info: TokenInfo, pool_state: dict) -> Pubkey:
     """Sync token_info's quote asset from freshly-read curve state.
 
@@ -141,6 +194,9 @@ class PlatformAwareBuyer(Trader):
         curve_refresh_budget: float = 2.0,
         *,
         trust_create_event: bool = True,
+        risk_service: RiskService | None = None,
+        exposure_provider: ExposureProvider | None = None,
+        telemetry_recorder: TelemetryRecorder | None = None,
     ):
         """Initialize platform-aware token buyer.
 
@@ -179,6 +235,9 @@ class PlatformAwareBuyer(Trader):
         self.compute_units = compute_units or {}
         self.curve_refresh_budget = curve_refresh_budget
         self.trust_create_event = trust_create_event
+        self.risk_service = risk_service
+        self.exposure_provider = exposure_provider
+        self.telemetry_recorder = telemetry_recorder
         # SOL-paired coins always use `amount`; other quotes need an explicit
         # per-mint amount because 0.0001 USDC and 0.0001 SOL are not comparable.
         self.quote_amounts: dict[Pubkey, float] = {
@@ -197,9 +256,53 @@ class PlatformAwareBuyer(Trader):
         """
         return self.quote_amounts.get(quote_mint)
 
-    async def execute(self, token_info: TokenInfo) -> TradeResult:
+    async def execute(
+        self,
+        token_info: TokenInfo,
+        *,
+        existing_signature: str | None = None,
+        existing_last_valid_block_height: int | None = None,
+        logical_execution_id: str | None = None,
+        submission_recorder: SubmissionRecorder | None = None,
+    ) -> TradeResult:
         """Execute buy operation using platform-specific implementations."""
         try:
+            previously_confirmed = False
+            if existing_signature is not None:
+                observation = await self.client.observe_transaction(
+                    existing_signature,
+                    last_valid_block_height=existing_last_valid_block_height,
+                )
+                self.client.last_transaction_observation = observation
+                if observation.succeeded:
+                    previously_confirmed = True
+                elif observation.state in {
+                    ExecutionState.NOT_OBSERVED,
+                    ExecutionState.TIMED_OUT,
+                    ExecutionState.SIGNATURE_RECEIVED,
+                    ExecutionState.RPC_ACCEPTED,
+                    ExecutionState.DROPPED_UNKNOWN,
+                }:
+                    return TradeResult(
+                        success=False,
+                        platform=token_info.platform,
+                        tx_signature=existing_signature,
+                        error_message="Previous buy signature remains ambiguous",
+                        error_classification=(
+                            observation.error_classification
+                            or ErrorClassification.ACCEPTED_BUT_NOT_OBSERVED
+                        ),
+                    )
+                elif observation.state == ExecutionState.FAILED_ON_CHAIN:
+                    return TradeResult(
+                        success=False,
+                        platform=token_info.platform,
+                        tx_signature=existing_signature,
+                        error_message="Previous buy failed on chain",
+                        error_classification=(
+                            ErrorClassification.ON_CHAIN_PROGRAM_FAILURE
+                        ),
+                    )
             # Get platform-specific implementations
             implementations = get_platform_implementations(
                 token_info.platform, self.client
@@ -211,6 +314,8 @@ class PlatformAwareBuyer(Trader):
             # Quote asset is resolved from the curve below; start from whatever
             # the listener gave us so extreme_fast_mode has a usable default.
             quote_mint = normalize_quote_mint(token_info.quote_mint)
+            exact_curve = None
+            exact_fee_schedule = None
 
             if self.extreme_fast_mode:
                 # Zero-RPC hot path — the point of extreme_fast_mode. When the
@@ -235,7 +340,22 @@ class PlatformAwareBuyer(Trader):
 
                 # Regular behavior with RPC call
                 # Fetch pool state to get price and mayhem mode status
-                pool_state = await curve_manager.get_pool_state(pool_address)
+                if token_info.platform == Platform.PUMP_FUN and hasattr(
+                    curve_manager, "get_pool_state_and_fee_schedule"
+                ):
+                    (
+                        pool_state,
+                        exact_fee_schedule,
+                    ) = await _read_pool_and_fees_with_retry(
+                        curve_manager,
+                        pool_address,
+                        budget_seconds=self.curve_refresh_budget,
+                    )
+                    exact_curve = curve_manager.curve_state(
+                        pool_state, token_mint=token_info.mint
+                    )
+                else:
+                    pool_state = await curve_manager.get_pool_state(pool_address)
                 token_price_sol = pool_state.get("price_per_token")
 
                 # Validate price_per_token is present and positive
@@ -275,19 +395,47 @@ class PlatformAwareBuyer(Trader):
             # trade: extreme_fast_mode fixes the token count and back-derives an
             # implied price, while the regular path fixes the spend and derives
             # the token count from the curve price.
+            buy_quote = None
+            execution_plan = None
             if self.extreme_fast_mode:
                 token_amount = self.extreme_fast_token_amount
                 token_price_sol = quote_amount / token_amount if token_amount > 0 else 0
+            elif exact_curve is not None and exact_fee_schedule is not None:
+                spend = QuoteAmountRaw.from_decimal(
+                    Decimal(str(quote_amount)),
+                    mint=quote_mint,
+                    decimals=exact_curve.quote_decimals,
+                    rounding=RoundingDirection.DOWN,
+                )
+                buy_quote = quote_buy(
+                    spend=spend,
+                    curve=exact_curve,
+                    fee_rates=exact_fee_schedule.select_for_buy_budget(exact_curve),
+                    trade_fee_rates=exact_fee_schedule.select(exact_curve),
+                    slippage=_fraction_to_basis_points(self.slippage),
+                )
+                if buy_quote.minimum_output.value <= 0:
+                    raise ValueError("Exact Pump buy quote produced zero token output")
+                token_amount = float(buy_quote.expected_output.to_decimal())
+                token_price_sol = quote_amount / token_amount
+                minimum_token_amount_raw = buy_quote.minimum_output.value
+                max_quote_amount_raw = buy_quote.maximum_input.value
+                execution_plan = ExecutionPlan.for_buy(
+                    buy_quote, logical_execution_id=logical_execution_id
+                )
             else:
                 token_amount = quote_amount / token_price_sol
 
-            # Calculate minimum token amount with slippage
-            minimum_token_amount = token_amount * (1 - self.slippage)
-            minimum_token_amount_raw = int(minimum_token_amount * 10**TOKEN_DECIMALS)
-
-            # Calculate maximum quote to spend with slippage, in the quote
-            # mint's own raw units (lamports for SOL, 1e-6 for USDC).
-            max_quote_amount_raw = int(quote_amount * quote_unit * (1 + self.slippage))
+            if buy_quote is None:
+                # Compatibility path for LetsBonk and zero-RPC extreme-fast
+                # mode. Pump's normal path above uses exact integer reserves.
+                minimum_token_amount = token_amount * (1 - self.slippage)
+                minimum_token_amount_raw = int(
+                    minimum_token_amount * 10**TOKEN_DECIMALS
+                )
+                max_quote_amount_raw = int(
+                    quote_amount * quote_unit * (1 + self.slippage)
+                )
 
             # Build buy instructions using platform-specific builder
             instructions = await instruction_builder.build_buy_instruction(
@@ -312,39 +460,108 @@ class PlatformAwareBuyer(Trader):
                 f"(max: {max_quote_amount_raw / quote_unit:.6f} {quote_label})"
             )
 
-            # Send transaction
-            tx_signature = await self.client.build_and_send_transaction(
-                instructions,
-                self.wallet.keypair,
-                skip_preflight=True,
-                max_retries=self.max_retries,
-                priority_fee=await self.priority_fee_manager.calculate_priority_fee(
-                    priority_accounts
-                ),
-                compute_unit_limit=instruction_builder.get_buy_compute_unit_limit(
-                    self._get_cu_override("buy", token_info.platform)
-                ),
-                account_data_size_limit=self._get_cu_override(
-                    "account_data_size", token_info.platform
-                ),
+            priority_fee = await self.priority_fee_manager.calculate_priority_fee(
+                priority_accounts
             )
+            compute_unit_limit = instruction_builder.get_buy_compute_unit_limit(
+                self._get_cu_override("buy", token_info.platform)
+            )
+            if not previously_confirmed:
+                await self._assess_risk(
+                    execution_plan,
+                    instructions,
+                    priority_fee,
+                    compute_unit_limit,
+                )
 
-            success = await self.client.confirm_transaction(tx_signature)
+            # Send transaction
+            if previously_confirmed:
+                tx_signature = existing_signature
+                success = True
+                telemetry = None
+            else:
+                telemetry = ExecutionTelemetry(
+                    execution_id=(
+                        execution_plan.logical_execution_id
+                        if execution_plan is not None
+                        else logical_execution_id
+                        or f"buy:{token_info.mint}:{monotonic()}"
+                    )
+                )
+                send_options = {
+                    "skip_preflight": True,
+                    "max_retries": self.max_retries,
+                    "priority_fee": priority_fee,
+                    "compute_unit_limit": compute_unit_limit,
+                    "account_data_size_limit": self._get_cu_override(
+                        "account_data_size", token_info.platform
+                    ),
+                    "telemetry": telemetry,
+                }
+                if submission_recorder is not None:
+                    send_options["submission_callback"] = submission_recorder
+                tx_signature = await self.client.build_and_send_transaction(
+                    instructions, self.wallet.keypair, **send_options
+                )
+
+                success = await self.client.confirm_transaction(tx_signature)
+                if not success:
+                    observation = getattr(
+                        self.client, "last_transaction_observation", None
+                    )
+                    if observation is not None:
+                        telemetry.error_classification = (
+                            observation.error_classification
+                        )
+                if self.telemetry_recorder is not None:
+                    self.telemetry_recorder(telemetry)
 
             if success:
                 logger.info(f"Buy transaction confirmed: {tx_signature}")
 
+                actual_execution = None
+                if token_info.platform == Platform.PUMP_FUN:
+                    if execution_plan is not None:
+                        actual_execution = await self.client.get_execution_result(
+                            execution_plan, tx_signature, self.wallet.pubkey
+                        )
+                    else:
+                        actual_execution = await self.client.get_execution_effects(
+                            logical_execution_id=str(tx_signature),
+                            side=ExecutionSide.BUY,
+                            signature=tx_signature,
+                            user=self.wallet.pubkey,
+                            token_mint=token_info.mint,
+                            quote_mint=quote_mint,
+                        )
+                    if (
+                        actual_execution.token_delta_raw is None
+                        or actual_execution.quote_delta_raw is None
+                    ):
+                        raise ValueError(
+                            "Confirmed Pump buy lacks authoritative balance/event effects"
+                        )
+                    tokens_raw = actual_execution.token_delta_raw
+                    quote_spent = actual_execution.quote_delta_raw
+                else:
+                    tokens_raw = None
+                    quote_spent = None
+
                 # Fetch actual tokens and SOL spent from transaction
                 # Uses preBalances/postBalances to get exact amounts
-                sol_destination = self._get_sol_destination(
-                    token_info, address_provider
-                )
-                tokens_raw, quote_spent = await self.client.get_buy_transaction_details(
-                    str(tx_signature),
-                    token_info.mint,
-                    sol_destination,
-                    quote_mint=quote_mint,
-                )
+                if tokens_raw is None or quote_spent is None:
+                    sol_destination = self._get_sol_destination(
+                        token_info, address_provider
+                    )
+                    (
+                        tokens_raw,
+                        quote_spent,
+                    ) = await self.client.get_buy_transaction_details(
+                        str(tx_signature),
+                        token_info.mint,
+                        sol_destination,
+                        quote_mint=quote_mint,
+                    )
 
                 if tokens_raw is not None and quote_spent is not None:
                     actual_amount = tokens_raw / 10**TOKEN_DECIMALS
@@ -375,6 +592,10 @@ class PlatformAwareBuyer(Trader):
                     tx_signature=tx_signature,
                     amount=token_amount,
                     price=token_price_sol,
+                    quote=buy_quote,
+                    execution_plan=execution_plan,
+                    execution_result=actual_execution,
+                    reused_existing_signature=previously_confirmed,
                 )
             else:
                 return TradeResult(
@@ -384,10 +605,64 @@ class PlatformAwareBuyer(Trader):
                 )
 
         except Exception as e:
+            failed_telemetry = locals().get("telemetry")
+            if isinstance(failed_telemetry, ExecutionTelemetry):
+                failed_telemetry.error_classification = (
+                    e.classification
+                    if hasattr(e, "classification")
+                    else ErrorClassification.UNKNOWN
+                )
+                if self.telemetry_recorder is not None:
+                    self.telemetry_recorder(failed_telemetry)
             logger.exception("Buy operation failed")
             return TradeResult(
                 success=False, platform=token_info.platform, error_message=str(e)
             )
+
+    async def _assess_risk(
+        self,
+        plan: ExecutionPlan | None,
+        instructions: list,
+        priority_fee_micro_lamports: int,
+        compute_unit_limit: int,
+    ) -> None:
+        if self.risk_service is None or not self.risk_service.limits.enforce:
+            return
+        if plan is None:
+            raise ValueError(
+                "risk enforcement requires an exact execution plan; "
+                "disable extreme-fast/legacy sizing"
+            )
+        base_fee = await self.client.estimate_base_fee_lamports(
+            instructions, self.wallet.pubkey
+        )
+        priority_fee = priority_fee_lamports_ceiling(
+            MicroLamportsPerCU(priority_fee_micro_lamports), compute_unit_limit
+        )
+        rent = Lamports(self.client.maximum_ata_rent_lamports(instructions))
+        existing, aggregate = (
+            await self.exposure_provider(plan.token_mint, plan.quote_mint)
+            if self.exposure_provider is not None
+            else (0, 0)
+        )
+        self.risk_service.assess(
+            plan,
+            RiskContext(
+                wallet_lamports=await self.client.get_wallet_balance_lamports(
+                    self.wallet.pubkey
+                ),
+                existing_position_exposure_raw=existing,
+                aggregate_exposure_raw=aggregate,
+                fee_exposure=FeeExposure(
+                    Lamports(base_fee) if base_fee is not None else None,
+                    priority_fee,
+                    rent,
+                ),
+                native_trade_spend_lamports=(
+                    plan.input_raw if is_sol_paired(plan.quote_mint) else 0
+                ),
+            ),
+        )
 
     def _get_pool_address(
         self, token_info: TokenInfo, address_provider: AddressProvider
@@ -592,6 +867,9 @@ class PlatformAwareSeller(Trader):
         slippage: float = 0.25,
         max_retries: int = 5,
         compute_units: dict | None = None,
+        risk_service: RiskService | None = None,
+        exposure_provider: ExposureProvider | None = None,
+        telemetry_recorder: TelemetryRecorder | None = None,
     ):
         """Initialize platform-aware token seller."""
         self.client = client
@@ -600,9 +878,20 @@ class PlatformAwareSeller(Trader):
         self.slippage = slippage
         self.max_retries = max_retries
         self.compute_units = compute_units or {}
+        self.risk_service = risk_service
+        self.exposure_provider = exposure_provider
+        self.telemetry_recorder = telemetry_recorder
 
     async def execute(
-        self, token_info: TokenInfo, token_amount: float, token_price: float
+        self,
+        token_info: TokenInfo,
+        token_amount: float,
+        token_price: float,
+        *,
+        existing_signature: str | None = None,
+        existing_last_valid_block_height: int | None = None,
+        logical_execution_id: str | None = None,
+        submission_recorder: SubmissionRecorder | None = None,
     ) -> TradeResult:
         """Execute sell operation using platform-specific implementations.
 
@@ -635,6 +924,41 @@ class PlatformAwareSeller(Trader):
             )
 
         try:
+            previously_confirmed = False
+            if existing_signature is not None:
+                observation = await self.client.observe_transaction(
+                    existing_signature,
+                    last_valid_block_height=existing_last_valid_block_height,
+                )
+                self.client.last_transaction_observation = observation
+                if observation.succeeded:
+                    previously_confirmed = True
+                elif observation.state in {
+                    ExecutionState.NOT_OBSERVED,
+                    ExecutionState.TIMED_OUT,
+                    ExecutionState.SIGNATURE_RECEIVED,
+                    ExecutionState.RPC_ACCEPTED,
+                    ExecutionState.DROPPED_UNKNOWN,
+                }:
+                    return TradeResult(
+                        success=False,
+                        platform=token_info.platform,
+                        tx_signature=existing_signature,
+                        error_message="Previous sell signature remains ambiguous",
+                        error_classification=(
+                            observation.error_classification
+                            or ErrorClassification.ACCEPTED_BUT_NOT_OBSERVED
+                        ),
+                    )
+                elif observation.state == ExecutionState.FAILED_ON_CHAIN:
+                    return TradeResult(
+                        success=False,
+                        platform=token_info.platform,
+                        tx_signature=existing_signature,
+                        error_message="Previous sell failed on chain",
+                        error_classification=ErrorClassification.ON_CHAIN_PROGRAM_FAILURE,
+                    )
+
             # Get platform-specific implementations
             implementations = get_platform_implementations(
                 token_info.platform, self.client
@@ -645,6 +969,8 @@ class PlatformAwareSeller(Trader):
 
             # Fall back to the listener's quote asset if the refresh below fails.
             quote_mint = normalize_quote_mint(token_info.quote_mint)
+            pool_state = None
+            exact_fee_schedule = None
 
             # Refresh mayhem-mode and cashback flags from curve state.
             # The sell account list is 16 (non-cashback) vs 17 (cashback), and
@@ -657,9 +983,19 @@ class PlatformAwareSeller(Trader):
                 # slightly stale slot reports the curve as missing, and silently
                 # falling back to create-time values risks a wrong creator_vault
                 # (ConstraintSeeds 0x7d6) or wrong mayhem fee_recipient.
-                pool_state, _ = await _read_pool_state_with_retry(
-                    curve_manager, pool_address
-                )
+                if token_info.platform == Platform.PUMP_FUN and hasattr(
+                    curve_manager, "get_pool_state_and_fee_schedule"
+                ):
+                    (
+                        pool_state,
+                        exact_fee_schedule,
+                    ) = await _read_pool_and_fees_with_retry(
+                        curve_manager, pool_address
+                    )
+                else:
+                    pool_state, _ = await _read_pool_state_with_retry(
+                        curve_manager, pool_address
+                    )
                 token_info.is_mayhem_mode = pool_state.get(
                     "is_mayhem_mode", token_info.is_mayhem_mode
                 )
@@ -686,6 +1022,12 @@ class PlatformAwareSeller(Trader):
                         new_creator
                     )
             except Exception as e:  # noqa: BLE001
+                if token_info.platform == Platform.PUMP_FUN and hasattr(
+                    curve_manager, "curve_state"
+                ):
+                    raise ValueError(
+                        "Current Pump curve/fee state is required for a safe sell"
+                    ) from e
                 logger.warning(
                     f"Could not refresh curve flags before sell ({e}); "
                     f"using token_info values is_mayhem_mode={token_info.is_mayhem_mode}, "
@@ -699,6 +1041,8 @@ class PlatformAwareSeller(Trader):
             token_balance_decimal = token_amount
             token_balance = int(token_amount * 10**TOKEN_DECIMALS)
             token_price_sol = token_price
+            sell_quote = None
+            execution_plan = None
 
             logger.info(f"Token balance: {token_balance_decimal:.6f}")
             logger.info(
@@ -713,13 +1057,40 @@ class PlatformAwareSeller(Trader):
                     error_message="No tokens to sell",
                 )
 
-            # Calculate expected quote output with slippage protection, in the
-            # quote mint's raw units.
-            expected_quote_output = token_balance_decimal * token_price_sol
-            min_quote_output = max(
-                1,
-                int((expected_quote_output * (1 - self.slippage)) * quote_unit),
-            )
+            if (
+                token_info.platform == Platform.PUMP_FUN
+                and pool_state is not None
+                and exact_fee_schedule is not None
+                and hasattr(curve_manager, "curve_state")
+            ):
+                exact_curve = curve_manager.curve_state(
+                    pool_state, token_mint=token_info.mint
+                )
+                sell_quote = quote_sell(
+                    tokens=TokenAmountRaw(
+                        token_balance, token_info.mint, TOKEN_DECIMALS
+                    ),
+                    curve=exact_curve,
+                    fee_rates=exact_fee_schedule.select(exact_curve),
+                    slippage=_fraction_to_basis_points(self.slippage),
+                )
+                if sell_quote.minimum_output.value <= 0:
+                    raise ValueError(
+                        "Exact Pump sell quote produced zero minimum output"
+                    )
+                expected_quote_output = float(sell_quote.expected_output.to_decimal())
+                min_quote_output = sell_quote.minimum_output.value
+                token_price_sol = expected_quote_output / token_balance_decimal
+                execution_plan = ExecutionPlan.for_sell(
+                    sell_quote, logical_execution_id=logical_execution_id
+                )
+            else:
+                # LetsBonk compatibility path; Pump uses curve output above.
+                expected_quote_output = token_balance_decimal * token_price_sol
+                min_quote_output = max(
+                    1,
+                    int((expected_quote_output * (1 - self.slippage)) * quote_unit),
+                )
             logger.info(
                 f"Selling {token_balance_decimal} tokens on {token_info.platform.value}"
             )
@@ -747,45 +1118,172 @@ class PlatformAwareSeller(Trader):
             )
 
             # Send transaction
-            tx_signature = await self.client.build_and_send_transaction(
-                instructions,
-                self.wallet.keypair,
-                skip_preflight=True,
-                max_retries=self.max_retries,
-                priority_fee=await self.priority_fee_manager.calculate_priority_fee(
-                    priority_accounts
-                ),
-                compute_unit_limit=instruction_builder.get_sell_compute_unit_limit(
-                    self._get_cu_override("sell", token_info.platform)
-                ),
-                account_data_size_limit=self._get_cu_override(
-                    "account_data_size", token_info.platform
-                ),
+            priority_fee = await self.priority_fee_manager.calculate_priority_fee(
+                priority_accounts
             )
+            compute_unit_limit = instruction_builder.get_sell_compute_unit_limit(
+                self._get_cu_override("sell", token_info.platform)
+            )
+            if not previously_confirmed:
+                await self._assess_risk(
+                    execution_plan,
+                    instructions,
+                    priority_fee,
+                    compute_unit_limit,
+                )
 
-            success = await self.client.confirm_transaction(tx_signature)
+            if previously_confirmed:
+                tx_signature = existing_signature
+                success = True
+                telemetry = None
+            else:
+                telemetry = ExecutionTelemetry(
+                    execution_id=(
+                        execution_plan.logical_execution_id
+                        if execution_plan is not None
+                        else logical_execution_id
+                        or f"sell:{token_info.mint}:{monotonic()}"
+                    )
+                )
+                send_options = {
+                    "skip_preflight": True,
+                    "max_retries": self.max_retries,
+                    "priority_fee": priority_fee,
+                    "compute_unit_limit": compute_unit_limit,
+                    "account_data_size_limit": self._get_cu_override(
+                        "account_data_size", token_info.platform
+                    ),
+                    "telemetry": telemetry,
+                }
+                if submission_recorder is not None:
+                    send_options["submission_callback"] = submission_recorder
+                tx_signature = await self.client.build_and_send_transaction(
+                    instructions, self.wallet.keypair, **send_options
+                )
+
+                success = await self.client.confirm_transaction(tx_signature)
+                if not success:
+                    observation = getattr(
+                        self.client, "last_transaction_observation", None
+                    )
+                    if observation is not None:
+                        telemetry.error_classification = (
+                            observation.error_classification
+                        )
+                if self.telemetry_recorder is not None:
+                    self.telemetry_recorder(telemetry)
 
             if success:
                 logger.info(f"Sell transaction confirmed: {tx_signature}")
+                actual_execution = (
+                    await self.client.get_execution_result(
+                        execution_plan, tx_signature, self.wallet.pubkey
+                    )
+                    if execution_plan is not None
+                    else None
+                )
+                if actual_execution is not None:
+                    if (
+                        actual_execution.token_delta_raw is None
+                        or actual_execution.quote_delta_raw is None
+                    ):
+                        raise ValueError(
+                            "Confirmed Pump sell lacks authoritative balance/event effects"
+                        )
+                    token_balance_decimal = float(
+                        Decimal(actual_execution.token_delta_raw)
+                        / Decimal(10**TOKEN_DECIMALS)
+                    )
+                    token_price_sol = float(
+                        (
+                            Decimal(actual_execution.quote_delta_raw)
+                            / Decimal(quote_unit)
+                        )
+                        / Decimal(str(token_balance_decimal))
+                    )
                 return TradeResult(
                     success=True,
                     platform=token_info.platform,
                     tx_signature=tx_signature,
                     amount=token_balance_decimal,
                     price=token_price_sol,
+                    quote=sell_quote,
+                    execution_plan=execution_plan,
+                    execution_result=actual_execution,
+                    reused_existing_signature=previously_confirmed,
                 )
             else:
                 return TradeResult(
                     success=False,
                     platform=token_info.platform,
+                    tx_signature=tx_signature,
                     error_message=f"Transaction failed to confirm: {tx_signature}",
+                    error_classification=(
+                        self.client.last_transaction_observation.error_classification
+                        if getattr(self.client, "last_transaction_observation", None)
+                        else ErrorClassification.CONFIRMATION_TIMEOUT
+                    ),
                 )
 
         except Exception as e:
+            failed_telemetry = locals().get("telemetry")
+            if isinstance(failed_telemetry, ExecutionTelemetry):
+                failed_telemetry.error_classification = (
+                    e.classification
+                    if hasattr(e, "classification")
+                    else ErrorClassification.UNKNOWN
+                )
+                if self.telemetry_recorder is not None:
+                    self.telemetry_recorder(failed_telemetry)
             logger.exception("Sell operation failed")
             return TradeResult(
-                success=False, platform=token_info.platform, error_message=str(e)
+                success=False,
+                platform=token_info.platform,
+                error_message=str(e),
+                error_classification=(
+                    e.classification
+                    if hasattr(e, "classification")
+                    else ErrorClassification.UNKNOWN
+                ),
             )
+
+    async def _assess_risk(
+        self,
+        plan: ExecutionPlan | None,
+        instructions: list,
+        priority_fee_micro_lamports: int,
+        compute_unit_limit: int,
+    ) -> None:
+        if self.risk_service is None or not self.risk_service.limits.enforce:
+            return
+        if plan is None:
+            raise ValueError("risk enforcement requires an exact execution plan")
+        base_fee = await self.client.estimate_base_fee_lamports(
+            instructions, self.wallet.pubkey
+        )
+        existing, aggregate = (
+            await self.exposure_provider(plan.token_mint, plan.quote_mint)
+            if self.exposure_provider is not None
+            else (0, 0)
+        )
+        self.risk_service.assess(
+            plan,
+            RiskContext(
+                wallet_lamports=await self.client.get_wallet_balance_lamports(
+                    self.wallet.pubkey
+                ),
+                existing_position_exposure_raw=existing,
+                aggregate_exposure_raw=aggregate,
+                fee_exposure=FeeExposure(
+                    Lamports(base_fee) if base_fee is not None else None,
+                    priority_fee_lamports_ceiling(
+                        MicroLamportsPerCU(priority_fee_micro_lamports),
+                        compute_unit_limit,
+                    ),
+                    Lamports(self.client.maximum_ata_rent_lamports(instructions)),
+                ),
+            ),
+        )
 
     def _get_pool_address(
         self, token_info: TokenInfo, address_provider: AddressProvider

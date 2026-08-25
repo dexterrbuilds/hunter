@@ -3,7 +3,7 @@ Position management for take profit/stop loss functionality.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 
 from solders.pubkey import Pubkey
@@ -80,7 +80,7 @@ class Position:
             symbol=symbol,
             entry_price=entry_price,
             quantity=quantity,
-            entry_time=datetime.utcnow(),
+            entry_time=datetime.now(UTC),
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
             max_hold_time=max_hold_time,
@@ -108,7 +108,7 @@ class Position:
 
         # Check max hold time
         if self.max_hold_time:
-            elapsed_time = (datetime.utcnow() - self.entry_time).total_seconds()
+            elapsed_time = (datetime.now(UTC) - self.entry_time).total_seconds()
             if elapsed_time >= self.max_hold_time:
                 return True, ExitReason.MAX_HOLD_TIME
 
@@ -124,7 +124,7 @@ class Position:
         self.is_active = False
         self.exit_price = exit_price
         self.exit_reason = exit_reason
-        self.exit_time = datetime.utcnow()
+        self.exit_time = datetime.now(UTC)
 
     def get_pnl(self, current_price: float | None = None) -> dict:
         """Calculate profit/loss for the position.

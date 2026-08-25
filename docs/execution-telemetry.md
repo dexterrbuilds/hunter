@@ -1,7 +1,9 @@
 # Execution telemetry schema
 
-Milestone 1 defines the schema but does not instrument every hot path. The
-corresponding typed model lives in `src/execution/telemetry.py`.
+Milestone 2 instruments the active standard JSON-RPC build, signing, submission,
+and confirmation path with the schema in `src/execution/telemetry.py`. Completed
+snapshots are persisted to SQLite after confirmation/inspection rather than by
+adding synchronous diagnostic logging to transaction construction.
 
 ## Clock rules
 
@@ -54,7 +56,7 @@ values.
 
 ## Derived measurements
 
-Later instrumentation may derive build, signing, RPC-response, signature,
+Consumers may derive build, signing, RPC-response, signature,
 landing, processed, confirmed, finalized, and end-to-end latency from monotonic
 stage pairs. Missing stages produce no derived latency rather than a guessed
 value.

@@ -23,17 +23,76 @@ except ImportError:
         "Using standard asyncio event loop (install uvloop/winloop for better performance)"
     )
 
+from application.risk import RiskLimits
 from config_loader import (
     get_platform_from_config,
     load_bot_config,
     print_config_summary,
     validate_platform_listener_combination,
 )
+from core.pubkeys import resolve_quote_mint
 from trading.universal_trader import (
     DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
     UniversalTrader,
 )
 from utils.logger import configure_safe_console_logging, setup_file_logging
+
+
+def _risk_limits_from_config(config: dict) -> RiskLimits:
+    """Load only explicitly raw/lamport-denominated risk values."""
+    risk = config.get("risk", {})
+
+    def boolean(name: str, default: bool) -> bool:
+        value = risk.get(name, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"risk.{name} must be true or false")
+        return value
+
+    def optional_int(name: str) -> int | None:
+        value = risk.get(name)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"risk.{name} must be a non-negative integer")
+        return value
+
+    interval = risk.get("trade_interval_seconds", 60.0)
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, int | float)
+        or interval <= 0
+    ):
+        raise ValueError("risk.trade_interval_seconds must be positive")
+
+    def quote_map(name: str) -> dict:
+        values = risk.get(name, {})
+        if not isinstance(values, dict):
+            raise ValueError(f"risk.{name} must be a quote-mint mapping")
+        result = {}
+        for mint, amount in values.items():
+            if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                raise ValueError(f"risk.{name}[{mint!r}] must be raw non-negative int")
+            result[resolve_quote_mint(mint)] = amount
+        return result
+
+    return RiskLimits(
+        enforce=boolean("enforce", False),
+        trading_enabled=boolean("trading_enabled", True),
+        emergency_kill_switch=boolean("emergency_kill_switch", False),
+        maximum_buy_raw_by_quote=quote_map("maximum_buy_raw_by_quote"),
+        maximum_position_raw_by_quote=quote_map("maximum_position_raw_by_quote"),
+        maximum_aggregate_exposure_raw_by_quote=quote_map(
+            "maximum_aggregate_exposure_raw_by_quote"
+        ),
+        maximum_total_transaction_fee_lamports=optional_int(
+            "maximum_total_transaction_fee_lamports"
+        ),
+        maximum_priority_fee_lamports=optional_int("maximum_priority_fee_lamports"),
+        minimum_wallet_reserve_lamports=optional_int("minimum_wallet_reserve_lamports"),
+        maximum_trades_per_interval=optional_int("maximum_trades_per_interval"),
+        trade_interval_seconds=float(interval),
+        reject_unknown_base_fee=boolean("reject_unknown_base_fee", True),
+    )
 
 
 def setup_logging(bot_name: str):
@@ -166,6 +225,13 @@ async def start_bot(config_path: str):
             compute_units=cfg.get("compute_units", {}),
             # Node provider configuration
             max_rps=cfg.get("node", {}).get("max_rps", 25),
+            database_path=cfg.get("storage", {}).get(
+                "database_path", "data/hunter.sqlite3"
+            ),
+            max_concurrent_positions=cfg.get("runtime", {}).get(
+                "max_concurrent_positions", 4
+            ),
+            risk_limits=_risk_limits_from_config(cfg),
         )
 
         await trader.start()

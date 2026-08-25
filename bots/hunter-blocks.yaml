@@ -118,3 +118,23 @@ cleanup:
 # Node provider configuration
 node:
   max_rps: 25 # Maximum requests per second
+
+risk:
+  enforce: false
+  trading_enabled: true
+  emergency_kill_switch: false
+  maximum_buy_raw_by_quote: {sol: 100_000_000, usdc: 100_000_000}
+  maximum_position_raw_by_quote: {sol: 200_000_000, usdc: 200_000_000}
+  maximum_aggregate_exposure_raw_by_quote: {sol: 500_000_000, usdc: 500_000_000}
+  maximum_total_transaction_fee_lamports: 10_000_000
+  maximum_priority_fee_lamports: 1_000_000
+  minimum_wallet_reserve_lamports: 50_000_000
+  maximum_trades_per_interval: 5
+  trade_interval_seconds: 60
+  reject_unknown_base_fee: true
+
+storage:
+  database_path: "data/hunter.sqlite3"
+
+runtime:
+  max_concurrent_positions: 4

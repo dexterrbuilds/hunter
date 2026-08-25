@@ -5,7 +5,9 @@ Solana client abstraction for blockchain operations.
 import asyncio
 import random
 import struct
-from typing import Any
+from time import monotonic
+from typing import Any, Callable
+from uuid import uuid4
 
 import aiohttp
 from solana.rpc.async_api import AsyncClient
@@ -20,9 +22,21 @@ from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction import Transaction
 
-from core.pubkeys import is_sol_paired
+from core.pubkeys import (
+    ASSOCIATED_TOKEN_PROGRAM,
+    TOKEN_ACCOUNT_RENT_EXEMPT_RESERVE,
+    is_sol_paired,
+)
 from core.rpc_rate_limiter import TokenBucketRateLimiter
+from domain.lifecycle import ExecutionState
+from domain.quotes import ExecutionPlan, ExecutionResult, ExecutionSide
+from execution.confirmation import TransactionObservation
+from execution.effects import parse_execution_result
+from execution.errors import ErrorClassification, ExecutionError
+from execution.ports import BlockhashContext
+from execution.telemetry import ExecutionTelemetry, priority_fee_lamports
 from utils.logger import get_logger
+from utils.redaction import endpoint_identifier
 
 logger = get_logger(__name__)
 
@@ -71,6 +85,7 @@ class SolanaClient:
         self.rpc_endpoint = rpc_endpoint
         self._client = None
         self._cached_blockhash: Hash | None = None
+        self._cached_blockhash_context: BlockhashContext | None = None
         self._blockhash_lock = asyncio.Lock()
         self._blockhash_updater_task = asyncio.create_task(
             self.start_blockhash_updater()
@@ -78,14 +93,17 @@ class SolanaClient:
         self._rate_limiter = TokenBucketRateLimiter(max_rps=max_rps)
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        self.last_execution_telemetry: ExecutionTelemetry | None = None
+        self.last_transaction_observation: TransactionObservation | None = None
 
     async def start_blockhash_updater(self, interval: float = 5.0):
         """Start background task to update recent blockhash."""
         while True:
             try:
-                blockhash = await self.get_latest_blockhash()
+                context = await self.get_latest_blockhash_context()
                 async with self._blockhash_lock:
-                    self._cached_blockhash = blockhash
+                    self._cached_blockhash_context = context
+                    self._cached_blockhash = Hash.from_string(context.blockhash)
             except Exception as e:
                 logger.warning(f"Blockhash fetch failed: {e!s}")
             finally:
@@ -97,6 +115,13 @@ class SolanaClient:
             if self._cached_blockhash is None:
                 raise RuntimeError("No cached blockhash available yet")
             return self._cached_blockhash
+
+    async def get_cached_blockhash_context(self) -> BlockhashContext:
+        """Return the cached blockhash together with its expiry boundary."""
+        async with self._blockhash_lock:
+            if self._cached_blockhash_context is None:
+                raise RuntimeError("No cached blockhash context available yet")
+            return self._cached_blockhash_context
 
     async def get_client(self) -> AsyncClient:
         """Get or create the AsyncClient instance.
@@ -149,6 +174,41 @@ class SolanaClient:
             return result["result"]
         return None
 
+    async def get_wallet_balance_lamports(self, owner: Pubkey) -> int:
+        """Read a wallet's native balance in lamports."""
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        response = await client.get_balance(owner, commitment="confirmed")
+        return int(response.value)
+
+    async def get_wallet_token_balance_raw(self, owner: Pubkey, mint: Pubkey) -> int:
+        """Sum all wallet token accounts for a mint without assuming a program."""
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                str(owner),
+                {"mint": str(mint)},
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ],
+        }
+        response = await self.post_rpc(body)
+        if not response or "result" not in response:
+            raise RuntimeError("wallet token balance RPC returned no result")
+        accounts = response["result"].get("value", [])
+        return sum(
+            int(
+                account.get("account", {})
+                .get("data", {})
+                .get("parsed", {})
+                .get("info", {})
+                .get("tokenAmount", {})
+                .get("amount", 0)
+            )
+            for account in accounts
+        )
+
     async def get_account_info(
         self, pubkey: Pubkey, commitment: str | None = None
     ) -> dict[str, Any]:
@@ -191,13 +251,24 @@ class SolanaClient:
         Returns:
             One entry per pubkey, in order; None for accounts that don't exist
         """
+        accounts, _slot = await self.get_multiple_accounts_with_context(
+            pubkeys, commitment=commitment
+        )
+        return accounts
+
+    async def get_multiple_accounts_with_context(
+        self, pubkeys: list[Pubkey], commitment: str | None = None
+    ) -> tuple[list[Any], int | None]:
+        """Return a slot-consistent account batch and its RPC context slot."""
         await self._rate_limiter.acquire()
         client = await self.get_client()
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
         response = await client.get_multiple_accounts(pubkeys, **kwargs)
-        return list(response.value)
+        context = getattr(response, "context", None)
+        slot = int(context.slot) if context is not None else None
+        return list(response.value), slot
 
     async def get_token_account_balance(
         self, token_account: Pubkey, commitment: str = "confirmed"
@@ -233,10 +304,84 @@ class SolanaClient:
         Returns:
             Recent blockhash as string
         """
+        context = await self.get_latest_blockhash_context()
+        return Hash.from_string(context.blockhash)
+
+    async def get_latest_blockhash_context(self) -> BlockhashContext:
+        """Fetch a blockhash with slot and last-valid block height."""
         await self._rate_limiter.acquire()
         client = await self.get_client()
         response = await client.get_latest_blockhash(commitment="processed")
-        return response.value.blockhash
+        return BlockhashContext.observed(
+            str(response.value.blockhash),
+            int(response.value.last_valid_block_height),
+            observed_slot=int(response.context.slot),
+            provider_id="solana-json-rpc",
+        )
+
+    async def get_block_height(self) -> int:
+        """Fetch the processed block height used to enforce blockhash expiry."""
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        response = await client.get_block_height(commitment="processed")
+        return int(response.value)
+
+    async def estimate_base_fee_lamports(
+        self,
+        instructions: list[Instruction],
+        fee_payer: Pubkey,
+    ) -> int | None:
+        """Ask the configured RPC for the fee of the exact legacy message."""
+        context = await self.get_valid_blockhash_context()
+        message = Message.new_with_blockhash(
+            instructions, fee_payer, Hash.from_string(context.blockhash)
+        )
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        response = await client.get_fee_for_message(message, commitment="processed")
+        return int(response.value) if response.value is not None else None
+
+    @staticmethod
+    def maximum_ata_rent_lamports(instructions: list[Instruction]) -> int:
+        """Conservatively count potential ATA creations in a transaction."""
+        count = sum(
+            instruction.program_id == ASSOCIATED_TOKEN_PROGRAM
+            for instruction in instructions
+        )
+        return count * TOKEN_ACCOUNT_RENT_EXEMPT_RESERVE
+
+    async def get_valid_blockhash_context(self) -> BlockhashContext:
+        """Refuse a cached blockhash that is known expired or excessively old."""
+        try:
+            context = await self.get_cached_blockhash_context()
+        except RuntimeError:
+            context = await self.get_latest_blockhash_context()
+            async with self._blockhash_lock:
+                self._cached_blockhash_context = context
+                self._cached_blockhash = Hash.from_string(context.blockhash)
+        # A one-minute age ceiling avoids signing with a cache whose updater has
+        # silently failed for most of a blockhash lifetime. Refresh before the
+        # block-height check rather than trying to estimate slot duration.
+        if context.age_seconds() >= 60:
+            context = await self.get_latest_blockhash_context()
+            async with self._blockhash_lock:
+                self._cached_blockhash_context = context
+                self._cached_blockhash = Hash.from_string(context.blockhash)
+        current_height = await self.get_block_height()
+        if context.is_expired(current_height):
+            fresh = await self.get_latest_blockhash_context()
+            current_height = await self.get_block_height()
+            if fresh.is_expired(current_height):
+                raise ExecutionError(
+                    ErrorClassification.BLOCKHASH_EXPIRED,
+                    "RPC returned an already-expired blockhash",
+                    retryable=True,
+                )
+            async with self._blockhash_lock:
+                self._cached_blockhash_context = fresh
+                self._cached_blockhash = Hash.from_string(fresh.blockhash)
+            context = fresh
+        return context
 
     async def build_and_send_transaction(
         self,
@@ -247,6 +392,9 @@ class SolanaClient:
         priority_fee: int | None = None,
         compute_unit_limit: int | None = None,
         account_data_size_limit: int | None = None,
+        telemetry: ExecutionTelemetry | None = None,
+        submission_callback: Callable[[Signature, BlockhashContext | None], None]
+        | None = None,
     ) -> Signature:
         """
         Send a transaction with optional priority fee and compute unit limit.
@@ -260,16 +408,28 @@ class SolanaClient:
             compute_unit_limit: Optional compute unit limit. Defaults to 85,000 if not provided.
             account_data_size_limit: Optional account data size limit in bytes (e.g., 512_000).
                                     Reduces CU cost from 16k to ~128 CU. Must be first instruction.
+            submission_callback: Optional durable identity recorder invoked
+                immediately after the RPC returns a signature and before this
+                method returns to confirmation logic.
 
         Returns:
             Transaction signature.
         """
         client = await self.get_client()
+        telemetry = telemetry or ExecutionTelemetry(execution_id=str(uuid4()))
+        self.last_execution_telemetry = telemetry
+        telemetry.provider_id = "solana-json-rpc"
+        rpc_endpoint = getattr(self, "rpc_endpoint", "http://unconfigured.invalid")
+        telemetry.endpoint_id = endpoint_identifier(rpc_endpoint)
+        if telemetry.trade_requested_at is None:
+            telemetry.mark("trade_requested")
+        telemetry.compute_unit_price_micro_lamports = priority_fee
 
         logger.info(
             f"Priority fee in microlamports: {priority_fee if priority_fee else 0}"
         )
 
+        telemetry.mark("build_started")
         # Add compute budget instructions if applicable
         if (
             priority_fee is not None
@@ -286,6 +446,7 @@ class SolanaClient:
 
             # Set compute unit limit (use provided value or default to 85,000)
             cu_limit = compute_unit_limit if compute_unit_limit is not None else 85_000
+            telemetry.compute_unit_limit = cu_limit
             fee_instructions.append(set_compute_unit_limit(cu_limit))
 
             # Set priority fee if provided
@@ -294,21 +455,62 @@ class SolanaClient:
 
             instructions = fee_instructions + instructions
 
-        recent_blockhash = await self.get_cached_blockhash()
+        # Test/legacy harnesses may only implement the Milestone 1 Hash cache.
+        # Production SolanaClient instances always have the expiry-aware cache.
+        blockhash_context = None
+        if hasattr(self, "_cached_blockhash_context"):
+            blockhash_context = await self.get_valid_blockhash_context()
+            recent_blockhash = Hash.from_string(blockhash_context.blockhash)
+            telemetry.blockhash = blockhash_context.blockhash
+            telemetry.last_valid_block_height = (
+                blockhash_context.last_valid_block_height
+            )
+            telemetry.submitted_slot = blockhash_context.observed_slot
+        else:
+            recent_blockhash = await self.get_cached_blockhash()
         message = Message(instructions, signer_keypair.pubkey())
+        telemetry.mark("build_completed")
+        telemetry.mark("signing_started")
         transaction = Transaction([signer_keypair], message, recent_blockhash)
+        telemetry.mark("signing_completed")
+        telemetry.transaction_size_bytes = len(bytes(transaction))
+        if priority_fee is not None and telemetry.compute_unit_limit is not None:
+            telemetry.priority_fee_lamports = priority_fee_lamports(
+                priority_fee, telemetry.compute_unit_limit
+            )
 
         for attempt in range(max_retries):
             try:
+                if (
+                    blockhash_context is not None
+                    and attempt > 0
+                    and blockhash_context.is_expired(await self.get_block_height())
+                ):
+                    raise ExecutionError(
+                        ErrorClassification.BLOCKHASH_EXPIRED,
+                        "signed transaction blockhash expired during submission retries",
+                        retryable=True,
+                    )
                 await self._rate_limiter.acquire()
                 tx_opts = TxOpts(
                     skip_preflight=skip_preflight, preflight_commitment=Processed
                 )
+                telemetry.mark("submission_started")
                 response = await client.send_transaction(transaction, tx_opts)
+                telemetry.mark("rpc_responded")
+                telemetry.mark("signature_received")
+                telemetry.transaction_signature = str(response.value)
+                if submission_callback is not None:
+                    submission_callback(response.value, blockhash_context)
                 return response.value
 
             except Exception as e:
                 if attempt == max_retries - 1:
+                    telemetry.error_classification = (
+                        e.classification
+                        if isinstance(e, ExecutionError)
+                        else ErrorClassification.RPC_TRANSPORT_FAILURE
+                    )
                     logger.exception(
                         f"Failed to send transaction after {max_retries} attempts"
                     )
@@ -319,6 +521,38 @@ class SolanaClient:
                     f"Transaction attempt {attempt + 1} failed: {e!s}, retrying in {wait_time}s"
                 )
                 await asyncio.sleep(wait_time)
+
+    async def submit_wire_transaction(
+        self,
+        wire_bytes: bytes,
+        *,
+        skip_preflight: bool = True,
+        max_retries: int = 3,
+    ) -> str:
+        """Submit already-signed wire bytes through standard JSON-RPC only."""
+        import base64
+
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                base64.b64encode(wire_bytes).decode("ascii"),
+                {
+                    "encoding": "base64",
+                    "skipPreflight": skip_preflight,
+                    "maxRetries": max_retries,
+                },
+            ],
+        }
+        response = await self.post_rpc(body, max_retries=max_retries)
+        if not response or not response.get("result"):
+            raise ExecutionError(
+                ErrorClassification.RPC_REJECTION,
+                "sendTransaction returned no signature",
+                retryable=True,
+            )
+        return str(response["result"])
 
     async def confirm_transaction(
         self, signature: str | Signature, commitment: str = "confirmed"
@@ -346,17 +580,114 @@ class SolanaClient:
                 logger.exception(f"Malformed transaction signature: {signature}")
                 return False
 
+        observation = await self.observe_transaction(signature, commitment=commitment)
+        self.last_transaction_observation = observation
+        return observation.succeeded
+
+    async def observe_transaction(
+        self,
+        signature: str | Signature,
+        *,
+        commitment: str = "confirmed",
+        last_valid_block_height: int | None = None,
+        metadata_grace_seconds: float = 10.0,
+    ) -> TransactionObservation:
+        """Distinguish landing, failure, expiry, timeout, and RPC invisibility."""
+        try:
+            signature_object = (
+                Signature.from_string(signature)
+                if isinstance(signature, str)
+                else signature
+            )
+        except ValueError:
+            return TransactionObservation(
+                str(signature),
+                ExecutionState.DROPPED_UNKNOWN,
+                error_classification=ErrorClassification.MALFORMED_EVENT_STATE,
+            )
+
         await self._rate_limiter.acquire()
         client = await self.get_client()
         try:
             await client.confirm_transaction(
-                signature, commitment=commitment, sleep_seconds=1
+                signature_object,
+                commitment=commitment,
+                sleep_seconds=1,
+                last_valid_block_height=last_valid_block_height,
             )
+        except TypeError:
+            # Compatibility with providers/test doubles that do not accept the
+            # optional validity parameter.
+            try:
+                await client.confirm_transaction(
+                    signature_object, commitment=commitment, sleep_seconds=1
+                )
+            except Exception:
+                logger.exception(f"Failed to confirm transaction {signature_object}")
+                return TransactionObservation(
+                    str(signature_object),
+                    ExecutionState.TIMED_OUT,
+                    error_classification=ErrorClassification.CONFIRMATION_TIMEOUT,
+                )
         except Exception:
-            logger.exception(f"Failed to confirm transaction {signature}")
-            return False
+            if last_valid_block_height is not None:
+                try:
+                    if await self.get_block_height() > last_valid_block_height:
+                        return TransactionObservation(
+                            str(signature_object),
+                            ExecutionState.EXPIRED,
+                            error_classification=ErrorClassification.BLOCKHASH_EXPIRED,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "Could not read block height while classifying confirmation timeout",
+                        exc_info=True,
+                    )
+            logger.exception(f"Failed to confirm transaction {signature_object}")
+            return TransactionObservation(
+                str(signature_object),
+                ExecutionState.TIMED_OUT,
+                error_classification=ErrorClassification.CONFIRMATION_TIMEOUT,
+            )
 
-        return await self.verify_transaction_succeeded(signature)
+        deadline = monotonic() + max(0, metadata_grace_seconds)
+        while True:
+            result = await self._get_transaction_result(signature_object)
+            if result:
+                meta_error = result.get("meta", {}).get("err")
+                slot = result.get("slot")
+                if meta_error:
+                    return TransactionObservation(
+                        str(signature_object),
+                        ExecutionState.FAILED_ON_CHAIN,
+                        slot=slot,
+                        meta_error=meta_error,
+                        error_classification=ErrorClassification.ON_CHAIN_PROGRAM_FAILURE,
+                    )
+                state = {
+                    "processed": ExecutionState.PROCESSED,
+                    "confirmed": ExecutionState.CONFIRMED,
+                    "finalized": ExecutionState.FINALIZED,
+                }.get(commitment, ExecutionState.CONFIRMED)
+                telemetry = getattr(self, "last_execution_telemetry", None)
+                if telemetry and telemetry.transaction_signature == str(
+                    signature_object
+                ):
+                    telemetry.landed_slot = slot
+                    telemetry.mark(state.value)
+                return TransactionObservation(
+                    str(signature_object),
+                    state,
+                    slot=slot,
+                    confirmation_status=commitment,
+                )
+            if monotonic() >= deadline:
+                return TransactionObservation(
+                    str(signature_object),
+                    ExecutionState.NOT_OBSERVED,
+                    error_classification=ErrorClassification.ACCEPTED_BUT_NOT_OBSERVED,
+                )
+            await asyncio.sleep(0.5)
 
     async def verify_transaction_succeeded(self, signature: str | Signature) -> bool:
         """Check whether a landed transaction actually executed successfully.
@@ -511,6 +842,72 @@ class SolanaClient:
 
         return tokens_received, sol_spent
 
+    async def get_execution_result(
+        self,
+        plan: ExecutionPlan,
+        signature: str | Signature,
+        user: Pubkey,
+    ) -> ExecutionResult:
+        """Parse actual trade effects from balances and the Pump TradeEvent."""
+        return await self.get_execution_effects(
+            logical_execution_id=plan.logical_execution_id,
+            side=plan.side,
+            signature=signature,
+            user=user,
+            token_mint=plan.token_mint,
+            quote_mint=plan.quote_mint,
+        )
+
+    async def get_execution_effects(
+        self,
+        *,
+        logical_execution_id: str,
+        side: ExecutionSide,
+        signature: str | Signature,
+        user: Pubkey,
+        token_mint: Pubkey,
+        quote_mint: Pubkey,
+    ) -> ExecutionResult:
+        """Parse effects even when a legacy path did not create a quote plan."""
+        signature_text = str(signature)
+        result = await self._get_transaction_result(signature_text)
+        if not result:
+            raise ExecutionError(
+                ErrorClassification.ACCEPTED_BUT_NOT_OBSERVED,
+                "confirmed transaction metadata is not yet observable",
+                retryable=True,
+            )
+        trade_event = None
+        try:
+            from interfaces.core import Platform
+            from utils.idl_manager import get_idl_manager
+
+            parser = get_idl_manager().get_parser(Platform.PUMP_FUN)
+            trade_event = parser.find_event_in_logs(
+                result.get("meta", {}).get("logMessages", []), "TradeEvent"
+            )
+        except Exception:  # noqa: BLE001
+            # Balance changes remain authoritative even when a provider omits
+            # log messages; fee fields are represented as unknown below.
+            trade_event = None
+        telemetry = getattr(self, "last_execution_telemetry", None)
+        priority_fee = (
+            telemetry.priority_fee_lamports
+            if telemetry and telemetry.transaction_signature == signature_text
+            else None
+        )
+        return parse_execution_result(
+            logical_execution_id=logical_execution_id,
+            side=side,
+            signature=signature_text,
+            transaction=result,
+            user=user,
+            token_mint=token_mint,
+            quote_mint=quote_mint,
+            trade_event=trade_event,
+            priority_fee_lamports=priority_fee,
+        )
+
     @staticmethod
     def _extract_positive_token_diff(meta: dict, mint_str: str) -> int | None:
         """Find the largest positive token balance change for a mint in a tx.
@@ -550,9 +947,7 @@ class SolanaClient:
 
         return best
 
-    async def _get_transaction_result(
-        self, signature: str | Signature
-    ) -> dict | None:
+    async def _get_transaction_result(self, signature: str | Signature) -> dict | None:
         """Fetch transaction result from RPC.
 
         Args:
@@ -591,6 +986,10 @@ class SolanaClient:
             return None
 
         return result
+
+    async def get_transaction_result(self, signature: str | Signature) -> dict | None:
+        """Public transaction inspection boundary."""
+        return await self._get_transaction_result(signature)
 
     async def post_rpc(
         self, body: dict[str, Any], max_retries: int = 3, max_429_retries: int = 10

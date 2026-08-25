@@ -1,8 +1,9 @@
-# Future execution interfaces
+# Execution interfaces
 
-This document defines the boundary for a later execution-layer refactor. It is
-a design contract only: Milestone 1 does not replace or route around the current
-`core.client.SolanaClient` implementation.
+Milestone 2 provides concrete boundaries around the existing
+`core.client.SolanaClient` without replacing it as Hunter's only active backend.
+The provider-neutral contracts and standard JSON-RPC adapters live under
+`src/execution/`; alternative delivery providers are not implemented.
 
 ## Principles
 
@@ -81,6 +82,8 @@ account reader, blockhash provider, fee estimator, and telemetry are injected
 ports shared by the orchestration layer.
 ```
 
-The first adapter in a later milestone will wrap the current standard Solana
-RPC behavior so that it remains the benchmark baseline. Alternative delivery
-methods will only be added after equivalent tests and measurements exist.
+The standard Solana RPC adapter remains the benchmark baseline. Alternative
+delivery methods will only be added after equivalent tests and measurements
+exist. Logical execution coordination now persists signatures and blockhash
+validity before confirmation, and ambiguous identities are inspected before a
+replacement is considered.

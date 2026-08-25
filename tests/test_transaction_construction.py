@@ -57,9 +57,7 @@ class TransactionConstructionTests(unittest.TestCase):
     def test_compute_budget_precedes_protocol_instructions(self) -> None:
         client = _TransactionClientHarness()
         signer = Keypair.from_seed(bytes(range(32)))
-        recipient = Pubkey.from_string(
-            "5wyFsNExysbXf2hTtcn8Tqd3urs9Nv85Zx1zNdAfTMmX"
-        )
+        recipient = Pubkey.from_string("5wyFsNExysbXf2hTtcn8Tqd3urs9Nv85Zx1zNdAfTMmX")
         protocol_instruction = transfer(
             TransferParams(
                 from_pubkey=signer.pubkey(),
@@ -68,6 +66,7 @@ class TransactionConstructionTests(unittest.TestCase):
             )
         )
 
+        submitted = []
         signature = asyncio.run(
             client.build_and_send_transaction(
                 [protocol_instruction],
@@ -77,10 +76,14 @@ class TransactionConstructionTests(unittest.TestCase):
                 priority_fee=321_000,
                 compute_unit_limit=180_000,
                 account_data_size_limit=12_500_000,
+                submission_callback=lambda signature, context: submitted.append(
+                    (str(signature), context)
+                ),
             )
         )
 
         self.assertEqual(signature, Signature.default())
+        self.assertEqual(submitted, [(str(Signature.default()), None)])
         transaction = client.rpc.transaction
         self.assertIsNotNone(transaction)
         transaction.verify()
@@ -107,6 +110,19 @@ class TransactionConstructionTests(unittest.TestCase):
         self.assertEqual(message.recent_blockhash, Hash.default())
         self.assertEqual(message.signer_keys(), [signer.pubkey()])
         self.assertTrue(client.rpc.options.skip_preflight)
+        telemetry = client.last_execution_telemetry
+        self.assertIsNotNone(telemetry.trade_requested_at)
+        self.assertIsNotNone(telemetry.build_started_at)
+        self.assertIsNotNone(telemetry.build_completed_at)
+        self.assertIsNotNone(telemetry.signing_started_at)
+        self.assertIsNotNone(telemetry.signing_completed_at)
+        self.assertIsNotNone(telemetry.submission_started_at)
+        self.assertIsNotNone(telemetry.rpc_responded_at)
+        self.assertIsNotNone(telemetry.signature_received_at)
+        self.assertEqual(telemetry.transaction_signature, str(Signature.default()))
+        self.assertGreater(telemetry.transaction_size_bytes, 0)
+        self.assertEqual(telemetry.compute_unit_limit, 180_000)
+        self.assertEqual(telemetry.priority_fee_lamports, 57_780)
 
     def test_no_compute_settings_preserves_protocol_instruction_as_first(self) -> None:
         client = _TransactionClientHarness()

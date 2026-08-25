@@ -64,7 +64,7 @@ QUOTE_TOKEN_PROGRAMS: Final[dict[Pubkey, Pubkey]] = {
 
 
 def quote_decimals(quote_mint: Pubkey) -> int:
-    """Get the decimal count for a quote mint, defaulting to SOL's 9.
+    """Get the configured decimal count for a supported quote mint.
 
     Args:
         quote_mint: Quote mint address
@@ -72,7 +72,12 @@ def quote_decimals(quote_mint: Pubkey) -> int:
     Returns:
         Number of decimals used by the quote mint
     """
-    return QUOTE_DECIMALS.get(quote_mint, 9)
+    try:
+        return QUOTE_DECIMALS[quote_mint]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported quote mint {quote_mint}: decimals are not configured"
+        ) from error
 
 
 def quote_units_per_token(quote_mint: Pubkey) -> int:
@@ -88,7 +93,7 @@ def quote_units_per_token(quote_mint: Pubkey) -> int:
 
 
 def quote_token_program(quote_mint: Pubkey) -> Pubkey:
-    """Get the token program owning a quote mint, defaulting to SPL Token.
+    """Get the explicitly configured token program owning a quote mint.
 
     Args:
         quote_mint: Quote mint address
@@ -96,7 +101,12 @@ def quote_token_program(quote_mint: Pubkey) -> Pubkey:
     Returns:
         Token program id for the quote mint
     """
-    return QUOTE_TOKEN_PROGRAMS.get(quote_mint, TOKEN_PROGRAM)
+    try:
+        return QUOTE_TOKEN_PROGRAMS[quote_mint]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported quote mint {quote_mint}: token program is not configured"
+        ) from error
 
 
 def normalize_quote_mint(quote_mint: Pubkey | None) -> Pubkey:
@@ -174,6 +184,9 @@ def resolve_quote_amounts(
     resolved: dict[Pubkey, float] = {}
     for key, amount in amounts.items():
         mint = resolve_quote_mint(key)
+        # Raw conversions and ATA derivation are unsafe without both values.
+        quote_decimals(mint)
+        quote_token_program(mint)
         if not isinstance(amount, int | float) or amount <= 0:
             raise ValueError(
                 f"quote_amounts[{key!r}] must be a positive number, got {amount!r}"

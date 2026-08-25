@@ -1,78 +1,92 @@
-# Known unresolved risks
+# Known risks
 
-These findings are intentionally unresolved in the Hunter Milestone 1 baseline.
-The bot's existing behavior was preserved so later fixes can be made against
-characterization tests. Do not treat this list as exhaustive.
+Hunter remains pre-production software. This list distinguishes Milestone 2
+improvements from risks that remain open; it is not exhaustive.
 
-## Funds and position safety
+## Resolved or materially improved in Milestone 2
 
-- **Positions are in memory.** A process restart loses position and exit state.
-- **Sell retry and recovery are incomplete.** Time-based exits have no durable
-  recovery path, and exhausted take-profit/stop-loss retries leave a position
-  active but unmonitored.
-- **Realized PnL is inaccurate.** Sell results use a supplied reference price
-  rather than parsing actual proceeds and do not include network, protocol,
-  priority, rent, or cleanup costs.
-- **The sell minimum is reference-price based.** It does not calculate exact
-  curve output, price impact, and protocol fees.
-- **Monetary calculations use floats.** Conversion to raw units truncates and
-  may expose binary floating-point edge cases.
-- **No exposure controls exist.** There is no durable per-trade, per-token,
-  daily-spend, aggregate-exposure, or loss limit.
-- **No kill switch exists.** A user cannot atomically disable all trading and
-  outstanding strategy activity through a dedicated safety control.
-- **No total-fee guard exists.** The priority-fee hard cap limits the price per
-  compute unit, not the transaction's total fee, rent, or full cost.
-- **Balance sufficiency is not checked before construction.** SOL, quote-token,
-  fee, and rent insufficiency are generally discovered during submission.
+- Positions, fills, lifecycle transitions, logical executions, attempts, and
+  telemetry are persisted in versioned SQLite storage.
+- Startup reconciles active inventory and never sells solely because persisted
+  and wallet balances differ.
+- Normal Pump sells use curve output, price impact, current fee state, and an
+  integer slippage floor instead of reference-price multiplication.
+- Realized accounting uses observed execution effects, supports partial exits,
+  and keeps SOL costs separate from SPL-quote PnL.
+- Exact Pump transaction amounts use typed raw integers and explicit rounding;
+  unsupported quote assets fail safely.
+- Blockhash age/expiry and last-valid height are tracked and checked.
+- Ambiguous signatures have durable identity and are inspected before any
+  economically equivalent replacement.
+- Trading, kill-switch, size/exposure, fee, wallet-reserve, and rate guards are
+  available and actively enforced when `risk.enforce` is enabled.
+- Continuous detection and position monitoring use separate bounded workers;
+  duplicate detections are claimed before enqueue.
 
-## Transaction delivery and confirmation
+## Remaining funds and accounting risks
 
-- **Blockhash freshness is not enforced.** The cache does not track retrieval
-  age or last-valid block height and can be unavailable at startup.
-- **Confirmation outcomes can be ambiguous.** Immediate transaction lookup may
-  lag even after submission or confirmation, while accepted-but-dropped
-  transactions are not distinctly represented.
-- **Submission is single-provider.** Reads, submission, and confirmation depend
-  on one configured RPC endpoint with no hedging or independent observer.
-- **No active rebroadcast policy exists.** Transport retries reuse one signed
-  transaction, while accepted-but-not-landed cases are not deliberately retried.
-- **Dynamic priority fees add hot-path latency.** Estimation requires another
-  RPC request and may not use exactly the same writable recipient selected for
-  the final transaction.
+- **Risk enforcement is opt-in for compatibility.** Existing configurations
+  continue with `risk.enforce: false`; operators must deliberately enable and
+  calibrate raw-unit limits.
+- **Legacy paths still use floats.** LetsBonk and Pump extreme-fast sizing retain
+  Milestone 1 floating-point behavior. Normal Pump plans use exact integers.
+- **Strategy monitoring still exposes decimal views.** Persisted raw accounting
+  is exact, but inherited TP/SL display and monitoring objects convert to float.
+- **Some execution costs remain unknowable.** Providers may omit event/log or
+  balance detail; unknown fees stay explicit. Cleanup transactions are not yet
+  allocated to a position.
+- **SPL-quoted net PnL needs FX data.** SOL network/rent costs are not converted
+  to USDC or another quote asset, so net quote PnL remains unknown when needed.
+- **No portfolio loss/drawdown policy exists.** Milestone 2 guards exposure and
+  fees but does not implement daily loss, drawdown, or price-oracle controls.
+- **Local key material remains in process memory.** No hardware, encrypted, or
+  remote signer is implemented.
 
-## Detection and throughput
+## Remaining execution and recovery risks
 
-- **Trade processing is serial.** A token may occupy the main queue through
-  buy, hold, and sell, delaying or dropping later detections.
-- **The default maximum token age is extremely small.** `0.001` seconds is
-  unrealistic once a token waits in a process queue.
-- **Some listeners can miss or delay events.** Confirmed block subscriptions
-  arrive later, the block parser can return only the first matching creation,
-  and lookup-table account resolution is not uniform across runtime parsers.
-- **Logging remains verbose.** Synchronous event-path logging may affect
-  latency even though credential redaction is now applied to configured sinks.
+- **Single-provider dependency remains.** Reads, submission, inspection, and
+  confirmation use the configured standard Solana JSON-RPC endpoint.
+- **No alternate observer or rebroadcast service exists.** Ambiguous outcomes
+  intentionally stop/reconcile rather than guessing; this favors duplicate-sale
+  safety over automatic liveness.
+- **A crash between chain landing and signature persistence is still possible.**
+  Hunter persists immediately after the RPC response, but no local system can
+  durably record a response it never received. Wallet reconciliation prevents
+  automatic selling, but operator review may be required.
+- **Unlinked pending buys need a repeated detection or operator recovery.** Buy
+  identities are durable and prevent duplicate resubmission for the same mint,
+  but a crash before position creation can leave a confirmed buy without enough
+  persisted token metadata for fully automatic reconstruction.
+- **Position aggregate and fill journal updates are separate SQLite
+  transactions.** The aggregate is authoritative and survives, but a crash
+  between writes can leave an incomplete audit journal requiring repair.
+- **Confirmation relies on RPC semantics.** Temporary `getTransaction`
+  invisibility is handled, but prolonged provider inconsistency can remain
+  accepted-but-not-observed.
+- **Dynamic priority fees add a hot-path RPC read.** No latency optimization or
+  provider benchmark is claimed in Milestone 2.
 
-## Protocol and configuration assumptions
+## Remaining protocol and throughput risks
 
-- **Unsupported quote-token assumptions are unsafe.** Unknown quote mints
-  default to nine decimals and legacy SPL Token behavior. Hunter should reject
-  them until metadata and support are explicit.
-- **Base token decimals are fixed at six.** This matches the current Pump.fun
-  path but is not a general token invariant.
-- **Fee-recipient selection can create contention.** The baseline uses one
-  normal or reserved fee recipient while randomizing the buyback recipient.
-- **Creation-event token-program inference has a legacy edge case.** The log
-  parser can infer Token-2022 when the exact create variant is not available.
-- **Configuration validation is incomplete.** Several zero, range, endpoint,
-  key-format, and compute/fee combinations are not rejected early.
+- **Base token decimals remain six on the Pump compatibility path.** This is an
+  explicit Pump assumption, not a general token invariant.
+- **Fee correctness depends on current on-chain state and vendored definitions.**
+  Missing/malformed Global or FeeConfig state fails closed; a protocol upgrade
+  may require an IDL/SDK review before Hunter can trade safely.
+- **Extreme-fast mode cannot produce a reserve-pinned quote.** Enforced risk
+  mode rejects paths without an exact plan; otherwise it retains characterized
+  behavior.
+- **Default token age is extremely small.** `0.001` seconds can reject events
+  after ordinary scheduling delay.
+- **Listener completeness varies.** Some listener/parser paths may miss events
+  or omit metadata; PumpPortal still requires authoritative chain refresh.
+- **Logging and local SQLite writes are not benchmarked.** Identity persistence
+  is correctness-critical; broader latency work belongs to a later milestone.
 
 ## Secret handling
 
-- **Local private keys remain supported.** The wallet keeps a base58 private
-  key string and a parsed keypair in process memory.
-- **Redaction is not a substitute for safe calls.** Newly added logging paths
-  must avoid passing secrets in the first place and must register configured
-  secret values before an error can be logged.
-- **No encrypted or remote signer exists.** Hardware and delegated signing are
-  future execution-layer work.
+- Redaction is defense in depth, not permission to log secrets. New paths must
+  avoid credential-bearing values and register configured secrets.
+- SQLite stores no private keys, RPC URLs, Geyser tokens, or Telegram secrets.
+- Generated databases, logs, `.env*` files (except `.env.example`), keypairs,
+  and token/session files remain ignored and must not be committed.

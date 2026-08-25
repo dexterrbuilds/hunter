@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 
+from protocol_fixtures import USER, token_info  # noqa: E402
 from solders.keypair import Keypair  # noqa: E402
 from solders.pubkey import Pubkey  # noqa: E402
 from solders.signature import Signature  # noqa: E402
@@ -24,6 +25,14 @@ from core.pubkeys import (  # noqa: E402
     quote_decimals,
     quote_units_per_token,
 )
+from domain.amounts import BasisPoints, QuoteAmountRaw, TokenAmountRaw  # noqa: E402
+from domain.quotes import (  # noqa: E402
+    CurveState,
+    FeeRates,
+    FeeSchedule,
+    quote_buy,
+    quote_sell,
+)
 from execution.telemetry import priority_fee_lamports  # noqa: E402
 from interfaces.core import Platform  # noqa: E402
 from platforms.pumpfun.address_provider import PumpFunAddressProvider  # noqa: E402
@@ -31,7 +40,6 @@ from platforms.pumpfun.curve_manager import PumpFunCurveManager  # noqa: E402
 from platforms.pumpfun.instruction_builder import (  # noqa: E402
     PumpFunInstructionBuilder,
 )
-from protocol_fixtures import USER, token_info  # noqa: E402
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller  # noqa: E402
 from trading.position import ExitReason, Position  # noqa: E402
 from utils.idl_manager import get_idl_manager  # noqa: E402
@@ -100,7 +108,35 @@ class _FakeCurveManager:
             "quote_mint": WSOL_MINT,
             "is_mayhem_mode": False,
             "is_cashback_coin": False,
+            "price_per_token": 0.00003,
         }
+
+
+class _ExactPumpCurveManager(_FakeCurveManager):
+    def __init__(self):
+        self.state = CurveState(
+            token_mint=token_info().mint,
+            quote_mint=WSOL_MINT,
+            token_decimals=6,
+            quote_decimals=9,
+            virtual_token_reserves=1_000_000_000_000,
+            virtual_quote_reserves=30_000_000_000,
+            real_token_reserves=800_000_000_000,
+            token_total_supply=1_000_000_000_000_000,
+            creator_present=True,
+        )
+        self.schedule = FeeSchedule(
+            (), fallback=FeeRates(BasisPoints(100), BasisPoints(50))
+        )
+
+    async def get_pool_state_and_fee_schedule(self, _pool):
+        return await self.get_pool_state(_pool), self.schedule
+
+    async def get_fee_schedule(self, commitment=None):
+        return self.schedule
+
+    def curve_state(self, _pool_state, token_mint):
+        return self.state
 
 
 class AmountAndSlippageTests(unittest.TestCase):
@@ -185,6 +221,79 @@ class AmountAndSlippageTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(builder.sell_args, (20_000_000, 70_000))
         self.assertEqual(client.transaction_kwargs["compute_unit_limit"], 120_000)
+
+    def test_regular_pump_buy_uses_exact_curve_quote(self) -> None:
+        builder = _CapturingBuilder()
+        client = _FakeClient()
+        manager = _ExactPumpCurveManager()
+        buyer = PlatformAwareBuyer(
+            client=client,
+            wallet=_FakeWallet(),
+            priority_fee_manager=_FakePriorityFees(),
+            amount=0.1,
+            slippage=0.3,
+            max_retries=1,
+        )
+        implementations = SimpleNamespace(
+            address_provider=PumpFunAddressProvider(),
+            instruction_builder=builder,
+            curve_manager=manager,
+        )
+        expected = quote_buy(
+            spend=QuoteAmountRaw(100_000_000, WSOL_MINT, 9),
+            curve=manager.state,
+            fee_rates=manager.schedule.select(manager.state),
+            slippage=BasisPoints(3000),
+        )
+        with patch(
+            "trading.platform_aware.get_platform_implementations",
+            return_value=implementations,
+        ):
+            result = asyncio.run(buyer.execute(token_info()))
+        self.assertFalse(result.success)
+        self.assertEqual(
+            builder.buy_args,
+            (expected.maximum_input.value, expected.minimum_output.value),
+        )
+
+    def test_regular_pump_sell_uses_curve_output_not_reference_price(self) -> None:
+        builder = _CapturingBuilder()
+        client = _FakeClient()
+        manager = _ExactPumpCurveManager()
+        seller = PlatformAwareSeller(
+            client=client,
+            wallet=_FakeWallet(),
+            priority_fee_manager=_FakePriorityFees(),
+            slippage=0.3,
+            max_retries=1,
+        )
+        implementations = SimpleNamespace(
+            address_provider=PumpFunAddressProvider(),
+            instruction_builder=builder,
+            curve_manager=manager,
+        )
+        expected = quote_sell(
+            tokens=TokenAmountRaw(20_000_000, token_info().mint, 6),
+            curve=manager.state,
+            fee_rates=manager.schedule.select(manager.state),
+            slippage=BasisPoints(3000),
+        )
+        with patch(
+            "trading.platform_aware.get_platform_implementations",
+            return_value=implementations,
+        ):
+            result = asyncio.run(
+                seller.execute(
+                    token_info(),
+                    token_amount=20,
+                    token_price=999.0,
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertEqual(
+            builder.sell_args,
+            (20_000_000, expected.minimum_output.value),
+        )
 
 
 class CurvePositionAndFeeTests(unittest.TestCase):

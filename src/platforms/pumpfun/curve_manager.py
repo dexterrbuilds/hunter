@@ -17,6 +17,8 @@ from core.pubkeys import (
     normalize_quote_mint,
     quote_units_per_token,
 )
+from domain.amounts import BasisPoints
+from domain.quotes import CurveState, FeeRates, FeeSchedule, FeeTier
 from interfaces.core import CurveManager, Platform
 from utils.idl_parser import IDLParser
 from utils.logger import get_logger
@@ -72,7 +74,7 @@ class PumpFunCurveManager(CurveManager):
 
         except Exception as e:
             logger.exception("Failed to get curve state")
-            raise ValueError(f"Invalid bonding curve state: {e!s}")
+            raise ValueError(f"Invalid bonding curve state: {e!s}") from e
 
     async def get_pool_state_and_token_program(
         self, pool_address: Pubkey, mint: Pubkey, commitment: str | None = None
@@ -110,6 +112,148 @@ class PumpFunCurveManager(CurveManager):
         curve_state_data = self._decode_curve_state_with_idl(curve_account.data)
         token_program = mint_account.owner if mint_account is not None else None
         return curve_state_data, token_program
+
+    async def get_fee_schedule(self, commitment: str | None = None) -> FeeSchedule:
+        """Read current Pump global fallback and dynamic fee-tier state."""
+        from platforms.pumpfun.address_provider import PumpFunAddresses
+
+        addresses = [PumpFunAddresses.GLOBAL, PumpFunAddresses.find_fee_config()]
+        if hasattr(self.client, "get_multiple_accounts_with_context"):
+            accounts, slot = await self.client.get_multiple_accounts_with_context(
+                addresses, commitment=commitment
+            )
+        else:
+            accounts = await self.client.get_multiple_accounts(
+                addresses, commitment=commitment
+            )
+            slot = None
+        global_account, fee_account = accounts
+        if global_account is None or not global_account.data:
+            raise ValueError("Pump global fee state is unavailable")
+        global_state = self._idl_parser.decode_account_data(
+            global_account.data, "Global", skip_discriminator=True
+        )
+        if not global_state:
+            raise ValueError("Pump global fee state is malformed")
+        fallback = FeeRates(
+            protocol_fee_bps=BasisPoints(int(global_state["fee_basis_points"])),
+            creator_fee_bps=BasisPoints(int(global_state["creator_fee_basis_points"])),
+            source="pump_global",
+        )
+        if fee_account is None or not fee_account.data:
+            return FeeSchedule((), fallback=fallback, source_slot=slot)
+        fee_state = self._idl_parser.decode_account_data(
+            fee_account.data, "FeeConfig", skip_discriminator=True
+        )
+        if not fee_state:
+            raise ValueError("Pump fee configuration is malformed")
+        tiers = tuple(
+            FeeTier(
+                market_cap_raw_threshold=int(tier["market_cap_lamports_threshold"]),
+                rates=self._decode_fee_rates(tier["fees"], "pump_fee_config"),
+            )
+            for tier in fee_state.get("fee_tiers", [])
+        )
+        if not tiers:
+            raise ValueError("Pump fee configuration has no fee tiers")
+        return FeeSchedule(tiers, fallback=fallback, source_slot=slot)
+
+    async def get_pool_state_and_fee_schedule(
+        self, pool_address: Pubkey, commitment: str | None = None
+    ) -> tuple[dict[str, Any], FeeSchedule]:
+        """Read curve and fee accounts in one slot-consistent RPC response."""
+        from platforms.pumpfun.address_provider import PumpFunAddresses
+
+        addresses = [
+            pool_address,
+            PumpFunAddresses.GLOBAL,
+            PumpFunAddresses.find_fee_config(),
+        ]
+        if hasattr(self.client, "get_multiple_accounts_with_context"):
+            accounts, slot = await self.client.get_multiple_accounts_with_context(
+                addresses, commitment=commitment
+            )
+        else:
+            accounts = await self.client.get_multiple_accounts(
+                addresses, commitment=commitment
+            )
+            slot = None
+        curve_account, global_account, fee_account = accounts
+        if curve_account is None or not curve_account.data:
+            raise ValueError(f"No data in bonding curve account {pool_address}")
+        if global_account is None or not global_account.data:
+            raise ValueError("Pump global fee state is unavailable")
+        pool_state = self._decode_curve_state_with_idl(curve_account.data)
+        pool_state["_source_slot"] = slot
+        global_state = self._idl_parser.decode_account_data(
+            global_account.data, "Global", skip_discriminator=True
+        )
+        if not global_state:
+            raise ValueError("Pump global fee state is malformed")
+        fallback = FeeRates(
+            protocol_fee_bps=BasisPoints(int(global_state["fee_basis_points"])),
+            creator_fee_bps=BasisPoints(int(global_state["creator_fee_basis_points"])),
+            source="pump_global",
+        )
+        if fee_account is None or not fee_account.data:
+            return pool_state, FeeSchedule((), fallback=fallback, source_slot=slot)
+        fee_state = self._idl_parser.decode_account_data(
+            fee_account.data, "FeeConfig", skip_discriminator=True
+        )
+        if not fee_state or not fee_state.get("fee_tiers"):
+            raise ValueError("Pump fee configuration is malformed or empty")
+        tiers = tuple(
+            FeeTier(
+                int(tier["market_cap_lamports_threshold"]),
+                self._decode_fee_rates(tier["fees"], "pump_fee_config"),
+            )
+            for tier in fee_state["fee_tiers"]
+        )
+        return pool_state, FeeSchedule(tiers, fallback=fallback, source_slot=slot)
+
+    @staticmethod
+    def _decode_fee_rates(data: dict[str, Any], source: str) -> FeeRates:
+        return FeeRates(
+            protocol_fee_bps=BasisPoints(int(data["protocol_fee_bps"])),
+            creator_fee_bps=BasisPoints(int(data["creator_fee_bps"])),
+            lp_fee_bps=BasisPoints(int(data.get("lp_fee_bps", 0))),
+            source=source,
+        )
+
+    def curve_state(
+        self,
+        pool_state: dict[str, Any],
+        *,
+        token_mint: Pubkey,
+        token_decimals: int = TOKEN_DECIMALS,
+        slot: int | None = None,
+    ) -> CurveState:
+        """Convert decoded account data into an exact immutable quote state."""
+        quote_mint = normalize_quote_mint(pool_state.get("quote_mint"))
+        creator = pool_state.get("creator")
+        creator_present = bool(creator) and creator not in {
+            str(Pubkey.default()),
+            Pubkey.default(),
+        }
+        return CurveState(
+            token_mint=token_mint,
+            quote_mint=quote_mint,
+            token_decimals=token_decimals,
+            quote_decimals=self._quote_decimals_or_raise(quote_mint),
+            virtual_token_reserves=int(pool_state["virtual_token_reserves"]),
+            virtual_quote_reserves=int(pool_state["virtual_quote_reserves"]),
+            real_token_reserves=int(pool_state["real_token_reserves"]),
+            token_total_supply=int(pool_state["token_total_supply"]),
+            creator_present=creator_present,
+            is_mayhem_mode=bool(pool_state.get("is_mayhem_mode", False)),
+            slot=slot if slot is not None else pool_state.get("_source_slot"),
+        )
+
+    @staticmethod
+    def _quote_decimals_or_raise(quote_mint: Pubkey) -> int:
+        from core.pubkeys import quote_decimals
+
+        return quote_decimals(quote_mint)
 
     async def calculate_price(self, pool_address: Pubkey) -> float:
         """Calculate current token price from bonding curve state.

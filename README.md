@@ -19,15 +19,19 @@ see [UPSTREAM.md](UPSTREAM.md) for provenance and licensing details.
 - Fixed or RPC-estimated priority fees and configurable compute limits
 - Time-based and take-profit/stop-loss exits
 - LetsBonk protocol support inherited from the audited baseline
+- Exact integer Pump curve quotes and execution-effect accounting
+- Persistent SQLite positions, restart reconciliation, and sell lifecycle state
+- Configurable risk, exposure, fee, reserve, rate, and kill-switch controls
+- Bounded token processing and independent position monitoring
+- Credential-safe execution telemetry on the standard JSON-RPC path
 - Offline protocol and transaction characterization tests
 
 ## In development
 
-- Modular trading-engine boundaries
-- Persistent positions and restart recovery
-- Provider-neutral execution and confirmation services
-- Accurate realized PnL and execution telemetry
-- Risk, exposure, and fee controls
+- Completion of the incremental `UniversalTrader` compatibility split
+- Fully automatic recovery of buys interrupted before position creation
+- Removal of legacy floating-point sizing from LetsBonk/extreme-fast paths
+- Portfolio-level loss and drawdown controls
 
 ## Planned
 
@@ -77,6 +81,14 @@ The examples in `bots/` document the currently supported settings:
 - `retries`: submission attempts and trading delays
 - `cleanup`: token-account cleanup policy
 - `node.max_rps`: local RPC request-rate limit
+- `storage.database_path` and `runtime.max_concurrent_positions`: durable state and
+  bounded worker ownership
+- `risk`: opt-in trading, kill-switch, raw exposure, fee, reserve, and rate
+  limits
+
+Risk enforcement defaults off for compatibility. Enabling it on a path without
+an exact execution plan fails closed. Raw quote limits are mint-denominated
+integers; Hunter does not silently reinterpret whole-unit values.
 
 Extreme-fast mode trusts complete Pump.fun `CreateEvent` state for its zero-read
 path. PumpPortal does not carry the same authoritative state, so Hunter performs
@@ -108,6 +120,7 @@ bot can spend funds. Do not use them as tests.
 
 - [Execution interfaces](docs/execution-interfaces.md)
 - [Execution telemetry](docs/execution-telemetry.md)
+- [Milestone 2 architecture and semantics](docs/architecture.md)
 - [Known unresolved risks](docs/known-risks.md)
 - [Upstream provenance](UPSTREAM.md)
 

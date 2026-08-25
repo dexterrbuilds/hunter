@@ -6,7 +6,7 @@ Provides functionality to load and parse Anchor IDL files and decode instruction
 import base64
 import json
 import struct
-from typing import Any
+from typing import Any, ClassVar
 
 import base58
 
@@ -23,16 +23,18 @@ class IDLParser:
 
     # A single source of truth for primitive type information, mapping the type name
     # to its struct format character and size in bytes.
-    _PRIMITIVE_TYPE_INFO = {
+    _PRIMITIVE_TYPE_INFO: ClassVar[dict[str, tuple[str | None, int]]] = {
         # type_name: (format_char, size_in_bytes)
         "u8": ("<B", 1),
         "u16": ("<H", 2),
         "u32": ("<I", 4),
         "u64": ("<Q", 8),
+        "u128": (None, 16),
         "i8": ("<b", 1),
         "i16": ("<h", 2),
         "i32": ("<i", 4),
         "i64": ("<q", 8),
+        "i128": (None, 16),
         "bool": ("<?", 1),
         "pubkey": (None, PUBLIC_KEY_SIZE),
         "string": (
@@ -414,6 +416,9 @@ class IDLParser:
                 element_type, array_length = type_def["array"]
                 element_size = self._calculate_type_min_size(element_type)
                 return element_size * array_length
+            if "vec" in type_def:
+                # A vector has a u32 element-count prefix and may be empty.
+                return STRING_LENGTH_PREFIX_SIZE
             if "option" in type_def:
                 # The None form is just the tag byte.
                 return OPTION_PREFIX_SIZE
@@ -495,6 +500,8 @@ class IDLParser:
                 return self._decode_defined_type(data, offset, type_name)
             if "array" in type_def:
                 return self._decode_array(data, offset, type_def["array"])
+            if "vec" in type_def:
+                return self._decode_vector(data, offset, type_def["vec"])
             if "option" in type_def:
                 return self._decode_option(data, offset, type_def["option"])
 
@@ -523,6 +530,22 @@ class IDLParser:
             array_data.append(value)
         return array_data, offset
 
+    def _decode_vector(
+        self, data: bytes, offset: int, element_type: str | dict
+    ) -> tuple[list[Any], int]:
+        """Decode a Borsh vector with a defensive length bound."""
+        length = struct.unpack_from("<I", data, offset)[0]
+        offset += STRING_LENGTH_PREFIX_SIZE
+        # No valid element can consume less than one byte. This also prevents a
+        # malformed account from forcing an unbounded allocation/loop.
+        if length > len(data) - offset:
+            raise ValueError("vector length exceeds remaining account data")
+        values = []
+        for _ in range(length):
+            value, offset = self._decode_type(data, offset, element_type)
+            values.append(value)
+        return values, offset
+
     def _decode_primitive(
         self, data: bytes, offset: int, type_name: str
     ) -> tuple[Any, int]:
@@ -540,6 +563,19 @@ class IDLParser:
             end = offset + PUBLIC_KEY_SIZE
             value = base58.b58encode(data[offset:end]).decode("utf-8")
             return value, end
+
+        if type_name in {"u128", "i128"}:
+            end = offset + 16
+            if end > len(data):
+                raise ValueError(f"insufficient data for {type_name}")
+            return (
+                int.from_bytes(
+                    data[offset:end],
+                    byteorder="little",
+                    signed=type_name == "i128",
+                ),
+                end,
+            )
 
         # Handle all numeric and bool types from the map
         fmt, size = self._PRIMITIVE_TYPE_INFO[type_name]

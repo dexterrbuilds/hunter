@@ -24,6 +24,7 @@ class ErrorClassification(StrEnum):
     FEE_RENT_INSUFFICIENCY = "fee_rent_insufficiency"
     UNSUPPORTED_QUOTE_TOKEN = "unsupported_quote_token"
     MALFORMED_EVENT_STATE = "malformed_event_state"
+    RISK_LIMIT_EXCEEDED = "risk_limit_exceeded"
     UNKNOWN = "unknown"
 
 
