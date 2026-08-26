@@ -4,9 +4,12 @@ Universal Geyser listener that works with any platform through the interface sys
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from time import monotonic_ns
 
 import grpc
 
+from execution.detection import record_detection
+from execution.telemetry import utc_now
 from geyser.generated import geyser_pb2, geyser_pb2_grpc
 from interfaces.core import Platform, TokenInfo
 from monitoring.base_listener import BaseTokenListener
@@ -143,9 +146,25 @@ class UniversalGeyserListener(BaseTokenListener):
 
                 try:
                     async for update in stub.Subscribe(iter([request])):
+                        observed_at = utc_now()
+                        observed_mono_ns = monotonic_ns()
                         token_info = await self._process_update(update)
                         if not token_info:
                             continue
+                        slot = (
+                            int(update.transaction.slot)
+                            if update.HasField("transaction")
+                            else None
+                        )
+                        record_detection(
+                            token_info,
+                            source="yellowstone_geyser",
+                            event_slot=slot,
+                            transaction_slot=slot,
+                            launch_slot=slot,
+                            observed_at=observed_at,
+                            observed_mono_ns=observed_mono_ns,
+                        )
 
                         logger.info(
                             f"New token detected: {token_info.name} ({token_info.symbol}) on {token_info.platform.value}"

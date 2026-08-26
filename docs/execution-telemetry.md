@@ -1,9 +1,10 @@
 # Execution telemetry schema
 
-Milestone 2 instruments the active standard JSON-RPC build, signing, submission,
-and confirmation path with the schema in `src/execution/telemetry.py`. Completed
-snapshots are persisted to SQLite after confirmation/inspection rather than by
-adding synchronous diagnostic logging to transaction construction.
+Milestone 3 instruments detection, the active standard JSON-RPC path, and every
+opt-in provider submission attempt with the schema in
+`src/execution/telemetry.py`. Completed snapshots are queued for asynchronous
+SQLite persistence after confirmation/inspection rather than adding disk I/O
+to submission.
 
 ## Clock rules
 
@@ -37,15 +38,21 @@ represent failures during construction, signing, transport, or confirmation.
 - `execution_id`: local correlation identifier
 - `provider_id`: logical provider/adapter name
 - `endpoint_id`: credential-free endpoint identifier
+- `logical_trade_id` and `execution_variant`
+- detector source, event/transaction/launch slots, and processing timestamps
 - `transaction_signature`
 - `blockhash`
+- blockhash source provider, source slot, and age at submission
 - `last_valid_block_height`
 - `submitted_slot`
 - `landed_slot`
 - `compute_unit_limit`
 - `compute_unit_price_micro_lamports`
 - `priority_fee_lamports`
+- fee estimate source, age, and estimation latency
+- separate base network fee, CU priority fee, Jito tip, rent, and other costs
 - `transaction_size_bytes`
+- `attributes.serialization_ms` for the signed wire serialization step
 - `error_classification`
 - `error_code`: sanitized provider or program code
 - `error_detail`: sanitized bounded detail for diagnosis
@@ -60,6 +67,13 @@ Consumers may derive build, signing, RPC-response, signature,
 landing, processed, confirmed, finalized, and end-to-end latency from monotonic
 stage pairs. Missing stages produce no derived latency rather than a guessed
 value.
+
+`provider_attempts` records bytes leaving Hunter, acknowledgement type/time,
+provider response class, Hunter-side HTTP-session creation/reuse generation,
+and sanitized diagnostics for each transport. Session reuse does not claim
+visibility into a provider proxy's underlying TCP socket. See
+[landing-metrics.md](landing-metrics.md) for exact slot definitions and
+[benchmarking.md](benchmarking.md) for the comparison report.
 
 Provider comparisons must use equivalent submission and confirmation policies
 and report distributions, sample counts, failure rates, and observation period.

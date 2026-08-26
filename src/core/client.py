@@ -5,8 +5,9 @@ Solana client abstraction for blockchain operations.
 import asyncio
 import random
 import struct
-from time import monotonic
-from typing import Any, Callable
+from collections.abc import Callable
+from time import monotonic, monotonic_ns
+from typing import Any
 from uuid import uuid4
 
 import aiohttp
@@ -20,6 +21,7 @@ from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
 from solders.signature import Signature
+from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction
 
 from core.pubkeys import (
@@ -33,14 +35,38 @@ from domain.quotes import ExecutionPlan, ExecutionResult, ExecutionSide
 from execution.confirmation import TransactionObservation
 from execution.effects import parse_execution_result
 from execution.errors import ErrorClassification, ExecutionError
-from execution.ports import BlockhashContext
+from execution.metrics import LandingMetrics, budget_warnings
+from execution.ports import (
+    BlockhashContext,
+    ExecutionContext,
+    SignedTransaction,
+    SubmissionResult,
+)
+from execution.providers.config import (
+    ExecutionRoutingConfig,
+    ProviderRole,
+)
+from execution.providers.factory import build_submission_router
+from execution.routing import SubmissionRouter
 from execution.telemetry import ExecutionTelemetry, priority_fee_lamports
+from execution.telemetry_sink import provider_attempt_from_result
 from utils.logger import get_logger
-from utils.redaction import endpoint_identifier
+from utils.redaction import endpoint_identifier, sanitize_text
 
 logger = get_logger(__name__)
 
+
+def maximum_ata_rent_lamports(instructions: list[Instruction]) -> int:
+    """Conservatively count potential ATA creations in a transaction."""
+    count = sum(
+        getattr(instruction, "program_id", None) == ASSOCIATED_TOKEN_PROGRAM
+        for instruction in instructions
+    )
+    return count * TOKEN_ACCOUNT_RENT_EXEMPT_RESERVE
+
+
 HTTP_TOO_MANY_REQUESTS = 429
+MAXIMUM_DIAGNOSTIC_CHARACTERS = 2_048
 
 
 def set_loaded_accounts_data_size_limit(bytes_limit: int) -> Instruction:
@@ -75,7 +101,13 @@ def set_loaded_accounts_data_size_limit(bytes_limit: int) -> Instruction:
 class SolanaClient:
     """Abstraction for Solana RPC client operations."""
 
-    def __init__(self, rpc_endpoint: str, max_rps: float = 25.0):
+    def __init__(
+        self,
+        rpc_endpoint: str,
+        max_rps: float = 25.0,
+        *,
+        maximum_blockhash_age_ms: int = 60_000,
+    ):
         """Initialize Solana client with RPC endpoint.
 
         Args:
@@ -84,6 +116,9 @@ class SolanaClient:
         """
         self.rpc_endpoint = rpc_endpoint
         self._client = None
+        self._role_clients: dict[ProviderRole, AsyncClient] = {}
+        self._role_endpoints: dict[ProviderRole, str] = {}
+        self._role_provider_ids: dict[ProviderRole, str] = {}
         self._cached_blockhash: Hash | None = None
         self._cached_blockhash_context: BlockhashContext | None = None
         self._blockhash_lock = asyncio.Lock()
@@ -95,6 +130,80 @@ class SolanaClient:
         self._session_lock = asyncio.Lock()
         self.last_execution_telemetry: ExecutionTelemetry | None = None
         self.last_transaction_observation: TransactionObservation | None = None
+        if maximum_blockhash_age_ms <= 0:
+            raise ValueError("maximum blockhash age must be positive")
+        self.maximum_blockhash_age_ms = maximum_blockhash_age_ms
+        self.submission_router: SubmissionRouter | None = None
+        self.execution_routing_config = ExecutionRoutingConfig()
+        self.execution_variant = "standard"
+        self.jito_tip_lamports = 0
+        self.jito_tip_account: Pubkey | None = None
+        self._active_execution_telemetry: dict[str, ExecutionTelemetry] = {}
+        self._telemetry_tasks: set[asyncio.Task[None]] = set()
+
+    def configure_execution_routing(
+        self,
+        config: ExecutionRoutingConfig,
+        *,
+        execution_variant: str = "standard",
+        jito_tip_lamports: int = 0,
+        jito_tip_account: str | Pubkey | None = None,
+    ) -> None:
+        """Configure optional delivery routing without changing the default RPC path."""
+        if jito_tip_lamports < 0:
+            raise ValueError("Jito tip must be non-negative")
+        if jito_tip_lamports and execution_variant not in {
+            "jito_tipped",
+            "helius_sender_tipped",
+        }:
+            raise ValueError("a Jito tip requires an explicitly tipped variant")
+        if jito_tip_lamports and jito_tip_account is None:
+            raise ValueError("a tipped variant requires a configured tip account")
+        self.execution_routing_config = config
+        self.maximum_blockhash_age_ms = config.maximum_blockhash_age_ms
+        self.execution_variant = execution_variant
+        self.jito_tip_lamports = jito_tip_lamports
+        self.jito_tip_account = (
+            Pubkey.from_string(jito_tip_account)
+            if isinstance(jito_tip_account, str)
+            else jito_tip_account
+        )
+        for role in ProviderRole:
+            endpoints = config.for_role(role)
+            if endpoints:
+                self._role_endpoints[role] = endpoints[0].endpoint
+                self._role_provider_ids[role] = endpoints[0].provider_id
+        self.submission_router = build_submission_router(
+            config, attempt_callback=self._record_provider_attempt
+        )
+
+    def _record_provider_attempt(self, result: SubmissionResult) -> None:
+        telemetry = self._active_execution_telemetry.get(result.signature)
+        if telemetry is not None:
+            telemetry.add_provider_attempt(provider_attempt_from_result(result))
+
+    async def warm_execution_providers(self) -> dict[str, bool]:
+        """Warm reusable provider sessions without sending a transaction."""
+        if self.submission_router is None:
+            return {}
+        return await self.submission_router.warm()
+
+    def _schedule_submission_slot_capture(self, telemetry: ExecutionTelemetry) -> None:
+        task = asyncio.create_task(
+            self._capture_submission_slot(telemetry),
+            name="hunter-submission-slot-observer",
+        )
+        self._telemetry_tasks.add(task)
+        task.add_done_callback(self._telemetry_tasks.discard)
+
+    async def _capture_submission_slot(self, telemetry: ExecutionTelemetry) -> None:
+        """Observe a post-ack slot off the hot path; absence remains explicit."""
+        try:
+            client = await self._get_client_for_role(ProviderRole.CONFIRM)
+            response = await client.get_slot(commitment="processed")
+            telemetry.submitted_slot = int(getattr(response, "value", response))
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not observe submission slot", exc_info=True)
 
     async def start_blockhash_updater(self, interval: float = 5.0):
         """Start background task to update recent blockhash."""
@@ -123,15 +232,29 @@ class SolanaClient:
                 raise RuntimeError("No cached blockhash context available yet")
             return self._cached_blockhash_context
 
-    async def get_client(self) -> AsyncClient:
+    async def get_client(self, role: ProviderRole | None = None) -> AsyncClient:
         """Get or create the AsyncClient instance.
 
         Returns:
             AsyncClient instance
         """
+        endpoint = self._role_endpoints.get(role) if role is not None else None
+        if endpoint is not None:
+            client = self._role_clients.get(role)
+            if client is None:
+                client = AsyncClient(endpoint)
+                self._role_clients[role] = client
+            return client
         if self._client is None:
             self._client = AsyncClient(self.rpc_endpoint)
         return self._client
+
+    async def _get_client_for_role(self, role: ProviderRole) -> AsyncClient:
+        """Use role routing while preserving older subclass contracts."""
+        try:
+            return await self.get_client(role)
+        except TypeError:
+            return await self.get_client()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create the shared aiohttp session.
@@ -158,10 +281,18 @@ class SolanaClient:
         if self._client:
             await self._client.close()
             self._client = None
+        for client in self._role_clients.values():
+            await client.close()
+        self._role_clients.clear()
 
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
+        if self.submission_router is not None:
+            await self.submission_router.close()
+            self.submission_router = None
+        if self._telemetry_tasks:
+            await asyncio.gather(*tuple(self._telemetry_tasks), return_exceptions=True)
 
     async def get_health(self) -> str | None:
         body = {
@@ -177,7 +308,7 @@ class SolanaClient:
     async def get_wallet_balance_lamports(self, owner: Pubkey) -> int:
         """Read a wallet's native balance in lamports."""
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.ACCOUNT_READ)
         response = await client.get_balance(owner, commitment="confirmed")
         return int(response.value)
 
@@ -226,7 +357,7 @@ class SolanaClient:
             ValueError: If account doesn't exist or has no data
         """
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.ACCOUNT_READ)
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
@@ -261,7 +392,7 @@ class SolanaClient:
     ) -> tuple[list[Any], int | None]:
         """Return a slot-consistent account batch and its RPC context slot."""
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.ACCOUNT_READ)
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
@@ -290,7 +421,7 @@ class SolanaClient:
             Token balance as integer
         """
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.ACCOUNT_READ)
         response = await client.get_token_account_balance(
             token_account, commitment=commitment
         )
@@ -310,19 +441,21 @@ class SolanaClient:
     async def get_latest_blockhash_context(self) -> BlockhashContext:
         """Fetch a blockhash with slot and last-valid block height."""
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.BLOCKHASH)
         response = await client.get_latest_blockhash(commitment="processed")
         return BlockhashContext.observed(
             str(response.value.blockhash),
             int(response.value.last_valid_block_height),
             observed_slot=int(response.context.slot),
-            provider_id="solana-json-rpc",
+            provider_id=self._role_provider_ids.get(
+                ProviderRole.BLOCKHASH, "solana-json-rpc"
+            ),
         )
 
     async def get_block_height(self) -> int:
         """Fetch the processed block height used to enforce blockhash expiry."""
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.BLOCKHASH)
         response = await client.get_block_height(commitment="processed")
         return int(response.value)
 
@@ -337,18 +470,14 @@ class SolanaClient:
             instructions, fee_payer, Hash.from_string(context.blockhash)
         )
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.BLOCKHASH)
         response = await client.get_fee_for_message(message, commitment="processed")
         return int(response.value) if response.value is not None else None
 
     @staticmethod
     def maximum_ata_rent_lamports(instructions: list[Instruction]) -> int:
         """Conservatively count potential ATA creations in a transaction."""
-        count = sum(
-            instruction.program_id == ASSOCIATED_TOKEN_PROGRAM
-            for instruction in instructions
-        )
-        return count * TOKEN_ACCOUNT_RENT_EXEMPT_RESERVE
+        return maximum_ata_rent_lamports(instructions)
 
     async def get_valid_blockhash_context(self) -> BlockhashContext:
         """Refuse a cached blockhash that is known expired or excessively old."""
@@ -362,7 +491,7 @@ class SolanaClient:
         # A one-minute age ceiling avoids signing with a cache whose updater has
         # silently failed for most of a blockhash lifetime. Refresh before the
         # block-height check rather than trying to estimate slot duration.
-        if context.age_seconds() >= 60:
+        if not context.is_acceptable_age(self.maximum_blockhash_age_ms):
             context = await self.get_latest_blockhash_context()
             async with self._blockhash_lock:
                 self._cached_blockhash_context = context
@@ -415,15 +544,26 @@ class SolanaClient:
         Returns:
             Transaction signature.
         """
-        client = await self.get_client()
         telemetry = telemetry or ExecutionTelemetry(execution_id=str(uuid4()))
         self.last_execution_telemetry = telemetry
-        telemetry.provider_id = "solana-json-rpc"
-        rpc_endpoint = getattr(self, "rpc_endpoint", "http://unconfigured.invalid")
+        role_provider_ids = getattr(self, "_role_provider_ids", {})
+        role_endpoints = getattr(self, "_role_endpoints", {})
+        telemetry.provider_id = role_provider_ids.get(
+            ProviderRole.SUBMIT, "solana-json-rpc"
+        )
+        rpc_endpoint = role_endpoints.get(
+            ProviderRole.SUBMIT,
+            getattr(self, "rpc_endpoint", "http://unconfigured.invalid"),
+        )
         telemetry.endpoint_id = endpoint_identifier(rpc_endpoint)
         if telemetry.trade_requested_at is None:
             telemetry.mark("trade_requested")
         telemetry.compute_unit_price_micro_lamports = priority_fee
+        execution_variant = getattr(self, "execution_variant", "standard")
+        jito_tip_lamports = getattr(self, "jito_tip_lamports", 0)
+        jito_tip_account = getattr(self, "jito_tip_account", None)
+        telemetry.execution_variant = execution_variant
+        telemetry.jito_tip_lamports = jito_tip_lamports
 
         logger.info(
             f"Priority fee in microlamports: {priority_fee if priority_fee else 0}"
@@ -455,17 +595,41 @@ class SolanaClient:
 
             instructions = fee_instructions + instructions
 
+        if jito_tip_lamports:
+            if jito_tip_account is None:
+                raise ExecutionError(
+                    ErrorClassification.CONFIGURATION_ERROR,
+                    "tipped execution variant has no configured tip account",
+                )
+            tip_instruction = transfer(
+                TransferParams(
+                    from_pubkey=signer_keypair.pubkey(),
+                    to_pubkey=jito_tip_account,
+                    lamports=jito_tip_lamports,
+                )
+            )
+            # This is a distinct signed execution variant. The Pump.fun
+            # instruction and its account ordering remain untouched.
+            instructions = [tip_instruction, *instructions]
+            telemetry.attributes["tip_instruction_count"] = 1
+
         # Test/legacy harnesses may only implement the Milestone 1 Hash cache.
         # Production SolanaClient instances always have the expiry-aware cache.
         blockhash_context = None
         if hasattr(self, "_cached_blockhash_context"):
+            blockhash_retrieval_started = monotonic_ns()
             blockhash_context = await self.get_valid_blockhash_context()
+            telemetry.attributes["blockhash_retrieval_ms"] = (
+                monotonic_ns() - blockhash_retrieval_started
+            ) / 1_000_000
             recent_blockhash = Hash.from_string(blockhash_context.blockhash)
             telemetry.blockhash = blockhash_context.blockhash
             telemetry.last_valid_block_height = (
                 blockhash_context.last_valid_block_height
             )
-            telemetry.submitted_slot = blockhash_context.observed_slot
+            telemetry.blockhash_source_slot = blockhash_context.observed_slot
+            telemetry.blockhash_source_provider = blockhash_context.provider_id
+            telemetry.blockhash_age_ms_at_submission = blockhash_context.age_ms()
         else:
             recent_blockhash = await self.get_cached_blockhash()
         message = Message(instructions, signer_keypair.pubkey())
@@ -473,12 +637,97 @@ class SolanaClient:
         telemetry.mark("signing_started")
         transaction = Transaction([signer_keypair], message, recent_blockhash)
         telemetry.mark("signing_completed")
-        telemetry.transaction_size_bytes = len(bytes(transaction))
+        serialization_started_ns = monotonic_ns()
+        transaction_wire_bytes = bytes(transaction)
+        telemetry.attributes["serialization_ms"] = (
+            monotonic_ns() - serialization_started_ns
+        ) / 1_000_000
+        telemetry.transaction_size_bytes = len(transaction_wire_bytes)
         if priority_fee is not None and telemetry.compute_unit_limit is not None:
             telemetry.priority_fee_lamports = priority_fee_lamports(
                 priority_fee, telemetry.compute_unit_limit
             )
 
+        routing_config = getattr(
+            self, "execution_routing_config", ExecutionRoutingConfig()
+        )
+        routing_config.validate_fee_exposure(
+            base_fee_lamports=telemetry.base_network_fee_lamports,
+            priority_fee_lamports=telemetry.priority_fee_lamports or 0,
+            jito_tip_lamports=telemetry.jito_tip_lamports,
+            rent_lamports=telemetry.maximum_rent_exposure_lamports,
+            other_known_cost_lamports=telemetry.other_known_cost_lamports,
+        )
+
+        submission_router = getattr(self, "submission_router", None)
+        if submission_router is not None:
+            if blockhash_context is None:
+                raise ExecutionError(
+                    ErrorClassification.CONFIGURATION_ERROR,
+                    "provider routing requires expiry-aware blockhash context",
+                )
+            if not blockhash_context.is_acceptable_age(
+                getattr(self, "maximum_blockhash_age_ms", 60_000)
+            ):
+                raise ExecutionError(
+                    ErrorClassification.BLOCKHASH_EXPIRED,
+                    "signed transaction blockhash exceeds configured age",
+                    retryable=True,
+                )
+            telemetry.blockhash_age_ms_at_submission = blockhash_context.age_ms()
+            signed = SignedTransaction(
+                transaction_wire_bytes, str(transaction.signatures[0])
+            )
+            context = ExecutionContext(
+                logical_trade_id=telemetry.logical_trade_id or telemetry.execution_id,
+                execution_id=telemetry.execution_id,
+                execution_variant=execution_variant,
+                blockhash=blockhash_context,
+                signature=signed.signature,
+                compute_unit_limit=telemetry.compute_unit_limit,
+                compute_unit_price_micro_lamports=priority_fee,
+                base_network_fee_lamports=telemetry.base_network_fee_lamports,
+                priority_fee_lamports=telemetry.priority_fee_lamports,
+                jito_tip_lamports=jito_tip_lamports,
+                rent_lamports=telemetry.maximum_rent_exposure_lamports,
+                other_known_cost_lamports=telemetry.other_known_cost_lamports,
+                detection_slot=telemetry.detection_slot,
+                launch_slot=telemetry.launch_slot,
+                detected_mono_ns=telemetry.detected_mono_ns,
+                metadata=dict(telemetry.attributes),
+            )
+            self._active_execution_telemetry[signed.signature] = telemetry
+            telemetry.mark("submission_started")
+            result = await submission_router.submit(signed, context)
+            telemetry.mark("rpc_responded")
+            telemetry.provider_id = result.provider_id
+            telemetry.endpoint_id = result.endpoint_id
+            if not result.acceptable_acknowledgement:
+                telemetry.error_classification = (
+                    result.error_classification or ErrorClassification.RPC_REJECTION
+                )
+                self._active_execution_telemetry.pop(signed.signature, None)
+                raise ExecutionError(
+                    telemetry.error_classification,
+                    result.diagnostic or "all configured submission transports failed",
+                    code=result.error_code,
+                    retryable=result.error_classification
+                    in {
+                        ErrorClassification.RPC_TRANSPORT_FAILURE,
+                        ErrorClassification.RPC_RATE_LIMIT,
+                        ErrorClassification.PROVIDER_UNAVAILABLE,
+                    },
+                )
+            telemetry.mark("signature_received")
+            telemetry.transaction_signature = result.signature
+            response_signature = Signature.from_string(result.signature)
+            if submission_callback is not None:
+                submission_callback(response_signature, blockhash_context)
+            if hasattr(self, "_telemetry_tasks"):
+                self._schedule_submission_slot_capture(telemetry)
+            return response_signature
+
+        client = await self._get_client_for_role(ProviderRole.SUBMIT)
         for attempt in range(max_retries):
             try:
                 if (
@@ -496,21 +745,70 @@ class SolanaClient:
                     skip_preflight=skip_preflight, preflight_commitment=Processed
                 )
                 telemetry.mark("submission_started")
+                if blockhash_context is not None:
+                    telemetry.blockhash_age_ms_at_submission = (
+                        blockhash_context.age_ms()
+                    )
+                submission_started_ns = telemetry.submission_started_mono_ns
                 response = await client.send_transaction(transaction, tx_opts)
+                signed_signature = str(transaction.signatures[0])
+                if str(response.value) != signed_signature:
+                    raise ExecutionError(
+                        ErrorClassification.RPC_REJECTION,
+                        "RPC returned a signature different from the signed transaction",
+                    )
                 telemetry.mark("rpc_responded")
                 telemetry.mark("signature_received")
                 telemetry.transaction_signature = str(response.value)
+                telemetry.add_provider_attempt(
+                    provider_attempt_from_result(
+                        SubmissionResult(
+                            signature=str(response.value),
+                            provider_id=telemetry.provider_id,
+                            endpoint_id=telemetry.endpoint_id or "unconfigured",
+                            execution_variant=telemetry.execution_variant,
+                            accepted=True,
+                            acknowledgement="signature",
+                            bytes_sent=len(transaction_wire_bytes),
+                            submit_started_mono_ns=submission_started_ns,
+                            acknowledged_mono_ns=telemetry.signature_received_mono_ns,
+                            response_wall_time=telemetry.signature_received_at,
+                        )
+                    )
+                )
                 if submission_callback is not None:
                     submission_callback(response.value, blockhash_context)
+                if hasattr(self, "_telemetry_tasks"):
+                    self._schedule_submission_slot_capture(telemetry)
                 return response.value
 
             except Exception as e:
-                if attempt == max_retries - 1:
-                    telemetry.error_classification = (
-                        e.classification
-                        if isinstance(e, ExecutionError)
-                        else ErrorClassification.RPC_TRANSPORT_FAILURE
+                classification = (
+                    e.classification
+                    if isinstance(e, ExecutionError)
+                    else ErrorClassification.RPC_TRANSPORT_FAILURE
+                )
+                telemetry.add_provider_attempt(
+                    provider_attempt_from_result(
+                        SubmissionResult(
+                            signature=str(transaction.signatures[0]),
+                            provider_id=telemetry.provider_id,
+                            endpoint_id=telemetry.endpoint_id or "unconfigured",
+                            execution_variant=telemetry.execution_variant,
+                            accepted=False,
+                            acknowledgement="error",
+                            bytes_sent=len(transaction_wire_bytes),
+                            submit_started_mono_ns=telemetry.submission_started_mono_ns,
+                            acknowledged_mono_ns=monotonic_ns(),
+                            error_classification=classification,
+                            diagnostic=sanitize_text(f"{type(e).__name__}: {e}")[
+                                :MAXIMUM_DIAGNOSTIC_CHARACTERS
+                            ],
+                        )
                     )
+                )
+                if attempt == max_retries - 1:
+                    telemetry.error_classification = classification
                     logger.exception(
                         f"Failed to send transaction after {max_retries} attempts"
                     )
@@ -545,7 +843,9 @@ class SolanaClient:
                 },
             ],
         }
-        response = await self.post_rpc(body, max_retries=max_retries)
+        response = await self.post_rpc(
+            body, max_retries=max_retries, role=ProviderRole.SUBMIT
+        )
         if not response or not response.get("result"):
             raise ExecutionError(
                 ErrorClassification.RPC_REJECTION,
@@ -582,6 +882,71 @@ class SolanaClient:
 
         observation = await self.observe_transaction(signature, commitment=commitment)
         self.last_transaction_observation = observation
+        submission_router = getattr(self, "submission_router", None)
+        if submission_router is not None:
+            await submission_router.drain()
+            self._active_execution_telemetry.pop(str(signature), None)
+        if getattr(self, "_telemetry_tasks", None):
+            await asyncio.gather(*tuple(self._telemetry_tasks), return_exceptions=True)
+        telemetry = getattr(self, "last_execution_telemetry", None)
+        if (
+            submission_router is not None
+            and telemetry is not None
+            and telemetry.transaction_signature == str(signature)
+        ):
+            slots_to_land = None
+            if telemetry.submitted_slot is not None and observation.slot is not None:
+                slots_to_land = observation.slot - telemetry.submitted_slot
+            status_rtt = telemetry.attributes.get("confirmation_observation_rtt_ms")
+            for attempt in telemetry.provider_attempts:
+                if not attempt.accepted:
+                    continue
+                submission_router.health.record_landing(
+                    attempt.provider_id,
+                    attempt.endpoint_id,
+                    str(signature),
+                    landed=observation.slot is not None,
+                    slots_to_land=slots_to_land,
+                    status_query_rtt_ms=(
+                        float(status_rtt)
+                        if isinstance(status_rtt, (int, float))
+                        else None
+                    ),
+                )
+        if telemetry is not None and telemetry.transaction_signature == str(signature):
+            metrics = LandingMetrics.from_telemetry(telemetry)
+            processing_ms = None
+            if (
+                telemetry.event_observed_mono_ns is not None
+                and telemetry.processing_started_mono_ns is not None
+            ):
+                processing_ms = (
+                    telemetry.processing_started_mono_ns
+                    - telemetry.event_observed_mono_ns
+                ) / 1_000_000
+            quote_ms = telemetry.attributes.get("quote_generation_ms")
+            blockhash_ms = telemetry.attributes.get("blockhash_retrieval_ms")
+            warnings = budget_warnings(
+                {
+                    "detection_processing_ms": processing_ms,
+                    "quote_generation_ms": (
+                        float(quote_ms) if isinstance(quote_ms, (int, float)) else None
+                    ),
+                    "blockhash_retrieval_ms": (
+                        float(blockhash_ms)
+                        if isinstance(blockhash_ms, (int, float))
+                        else None
+                    ),
+                    "transaction_build_ms": metrics.build_ms,
+                    "signing_ms": metrics.sign_ms,
+                    "submission_rtt_ms": metrics.submit_rtt_ms,
+                },
+                self.execution_routing_config.latency_budgets,
+            )
+            if warnings:
+                telemetry.attributes["latency_budget_warnings"] = "; ".join(warnings)
+                for warning in warnings:
+                    logger.warning("Execution latency budget: %s", warning)
         return observation.succeeded
 
     async def observe_transaction(
@@ -607,7 +972,8 @@ class SolanaClient:
             )
 
         await self._rate_limiter.acquire()
-        client = await self.get_client()
+        client = await self._get_client_for_role(ProviderRole.CONFIRM)
+        confirmation_started_ns = monotonic_ns()
         try:
             await client.confirm_transaction(
                 signature_object,
@@ -674,7 +1040,16 @@ class SolanaClient:
                     signature_object
                 ):
                     telemetry.landed_slot = slot
-                    telemetry.mark(state.value)
+                    if telemetry.processed_at is None:
+                        telemetry.mark("processed")
+                    if state in {ExecutionState.CONFIRMED, ExecutionState.FINALIZED}:
+                        if telemetry.confirmed_at is None:
+                            telemetry.mark("confirmed")
+                    if state == ExecutionState.FINALIZED:
+                        telemetry.mark("finalized")
+                    telemetry.attributes["confirmation_observation_rtt_ms"] = (
+                        monotonic_ns() - confirmation_started_ns
+                    ) / 1_000_000
                 return TransactionObservation(
                     str(signature_object),
                     state,
@@ -892,7 +1267,7 @@ class SolanaClient:
             trade_event = None
         telemetry = getattr(self, "last_execution_telemetry", None)
         priority_fee = (
-            telemetry.priority_fee_lamports
+            telemetry.priority_fee_lamports or 0
             if telemetry and telemetry.transaction_signature == signature_text
             else None
         )
@@ -906,6 +1281,11 @@ class SolanaClient:
             quote_mint=quote_mint,
             trade_event=trade_event,
             priority_fee_lamports=priority_fee,
+            delivery_tip_lamports=(
+                telemetry.jito_tip_lamports
+                if telemetry and telemetry.transaction_signature == signature_text
+                else 0
+            ),
         )
 
     @staticmethod
@@ -976,7 +1356,7 @@ class SolanaClient:
             ],
         }
 
-        response = await self.post_rpc(body)
+        response = await self.post_rpc(body, role=ProviderRole.CONFIRM)
         if not response or "result" not in response:
             logger.warning(f"Failed to get transaction {signature}")
             return None
@@ -992,7 +1372,11 @@ class SolanaClient:
         return await self._get_transaction_result(signature)
 
     async def post_rpc(
-        self, body: dict[str, Any], max_retries: int = 3, max_429_retries: int = 10
+        self,
+        body: dict[str, Any],
+        max_retries: int = 3,
+        max_429_retries: int = 10,
+        role: ProviderRole = ProviderRole.ACCOUNT_READ,
     ) -> dict[str, Any] | None:
         """Send a raw RPC request with rate limiting, retry, and 429 handling.
 
@@ -1000,6 +1384,7 @@ class SolanaClient:
             body: JSON-RPC request body.
             max_retries: Maximum number of retry attempts for errors.
             max_429_retries: Maximum number of retry attempts for 429 rate limits.
+            role: Provider role used to select an explicitly configured endpoint.
 
         Returns:
             Parsed JSON response, or None if all attempts fail.
@@ -1014,7 +1399,7 @@ class SolanaClient:
                 session = await self._get_session()
 
                 async with session.post(
-                    self.rpc_endpoint,
+                    self._role_endpoints.get(role, self.rpc_endpoint),
                     json=body,
                 ) as response:
                     if response.status == HTTP_TOO_MANY_REQUESTS:

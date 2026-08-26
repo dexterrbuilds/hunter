@@ -30,6 +30,7 @@ def parse_execution_result(
     quote_mint: Pubkey,
     trade_event: dict[str, Any] | None = None,
     priority_fee_lamports: int | None = None,
+    delivery_tip_lamports: int = 0,
 ) -> ExecutionResult:
     """Build actual execution accounting without reference-price estimates."""
     meta = transaction.get("meta", {})
@@ -48,6 +49,7 @@ def parse_execution_result(
             None,
             None,
             transaction.get("slot"),
+            delivery_tip_lamports=delivery_tip_lamports,
             error=str(error),
         )
 
@@ -115,6 +117,7 @@ def parse_execution_result(
         quote_mint,
         quote_amount,
         network_fee,
+        delivery_tip_lamports,
     )
     if rent is None:
         unknown.append("rent_or_other_native_effects")
@@ -132,6 +135,7 @@ def parse_execution_result(
         creator_fee_raw=creator_fee,
         rent_lamports=rent,
         slot=transaction.get("slot"),
+        delivery_tip_lamports=delivery_tip_lamports,
         unknown_costs=tuple(sorted(set(unknown))),
     )
 
@@ -164,6 +168,7 @@ def _derive_rent(
     quote_mint: Pubkey,
     quote_amount: int | None,
     network_fee: int | None,
+    delivery_tip_lamports: int,
 ) -> int | None:
     if network_fee is None:
         return None
@@ -181,9 +186,9 @@ def _derive_rent(
         return None
     native_delta = int(post[user_index]) - int(pre[user_index])
     if not is_sol_paired(quote_mint):
-        return -native_delta - network_fee
+        return -native_delta - network_fee - delivery_tip_lamports
     if quote_amount is None:
         return None
     if side == ExecutionSide.BUY:
-        return -native_delta - quote_amount - network_fee
-    return quote_amount - network_fee - native_delta
+        return -native_delta - quote_amount - network_fee - delivery_tip_lamports
+    return quote_amount - network_fee - native_delta - delivery_tip_lamports

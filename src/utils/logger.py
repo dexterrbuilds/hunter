@@ -1,11 +1,17 @@
 """Credential-safe logging utilities for Hunter."""
 
 import logging
+from atexit import register
+from copy import copy
+from logging.handlers import QueueHandler, QueueListener
+from queue import SimpleQueue
 
 from utils.redaction import sanitize_text
 
 # Global dict to store loggers
 _loggers: dict[str, logging.Logger] = {}
+_queue_listener: QueueListener | None = None
+_queue_handler: QueueHandler | None = None
 
 
 class RedactingFormatter(logging.Formatter):
@@ -14,6 +20,19 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Return a sanitized rendering, including exception text."""
         return sanitize_text(super().format(record))
+
+
+class RedactingQueueHandler(QueueHandler):
+    """Sanitize a prepared record before asynchronous handoff."""
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        # QueueHandler.prepare formats exception/stack text synchronously. Keep
+        # those objects for the listener thread and only render the cheap message
+        # interpolation before handoff.
+        prepared = copy(record)
+        prepared.msg = sanitize_text(record.getMessage())
+        prepared.args = None
+        return prepared
 
 
 def _formatter() -> RedactingFormatter:
@@ -54,9 +73,7 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     return logger
 
 
-def setup_file_logging(
-    filename: str = "hunter.log", level: int = logging.INFO
-) -> None:
+def setup_file_logging(filename: str = "hunter.log", level: int = logging.INFO) -> None:
     """Set up file logging for all loggers.
 
     Args:
@@ -78,3 +95,38 @@ def setup_file_logging(
     file_handler.setFormatter(_formatter())
 
     root_logger.addHandler(file_handler)
+
+
+def enable_async_logging() -> None:
+    """Move formatted log I/O off latency-sensitive asyncio tasks."""
+    global _queue_handler, _queue_listener
+    if _queue_listener is not None:
+        return
+    root_logger = logging.getLogger()
+    downstream = tuple(root_logger.handlers)
+    if not downstream:
+        console = logging.StreamHandler()
+        console.setFormatter(_formatter())
+        downstream = (console,)
+    queue: SimpleQueue[logging.LogRecord] = SimpleQueue()
+    queue_handler = RedactingQueueHandler(queue)
+    # Redact before the record leaves the caller thread. Downstream handlers
+    # retain the formatter as defense in depth.
+    root_logger.handlers.clear()
+    root_logger.addHandler(queue_handler)
+    listener = QueueListener(queue, *downstream, respect_handler_level=True)
+    listener.start()
+    _queue_handler = queue_handler
+    _queue_listener = listener
+
+
+def shutdown_async_logging() -> None:
+    """Flush queued records during orderly process shutdown."""
+    global _queue_handler, _queue_listener
+    if _queue_listener is not None:
+        _queue_listener.stop()
+    _queue_listener = None
+    _queue_handler = None
+
+
+register(shutdown_async_logging)

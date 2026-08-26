@@ -69,6 +69,10 @@ class _FakeClient:
     async def confirm_transaction(self, _signature: Signature) -> bool:
         return False
 
+    @staticmethod
+    def maximum_ata_rent_lamports(_instructions: list) -> int:
+        return 0
+
 
 class _CapturingBuilder:
     def __init__(self) -> None:

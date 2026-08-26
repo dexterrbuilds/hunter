@@ -384,6 +384,7 @@ class ExecutionResult:
     creator_fee_raw: int | None
     rent_lamports: int | None
     slot: int | None
+    delivery_tip_lamports: int = 0
     observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     unknown_costs: tuple[str, ...] = ()
     error: str | None = None

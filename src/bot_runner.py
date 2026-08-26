@@ -35,7 +35,11 @@ from trading.universal_trader import (
     DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
     UniversalTrader,
 )
-from utils.logger import configure_safe_console_logging, setup_file_logging
+from utils.logger import (
+    configure_safe_console_logging,
+    enable_async_logging,
+    setup_file_logging,
+)
 
 
 def _risk_limits_from_config(config: dict) -> RiskLimits:
@@ -105,6 +109,7 @@ def setup_logging(bot_name: str):
     log_filename = log_dir / f"{bot_name}_{timestamp}.log"
 
     setup_file_logging(str(log_filename))
+    enable_async_logging()
 
 
 async def start_bot(config_path: str):
@@ -197,6 +202,13 @@ async def start_bot(config_path: str):
                 "extra_percentage", 0.0
             ),
             hard_cap_prior_fee=cfg.get("priority_fees", {}).get("hard_cap", 500000),
+            priority_fee_strategy=cfg.get("priority_fees", {}).get("strategy"),
+            priority_fee_cache_ttl_seconds=cfg.get("priority_fees", {}).get(
+                "cache_ttl_seconds", 5.0
+            ),
+            priority_fee_refresh_interval_seconds=cfg.get("priority_fees", {}).get(
+                "refresh_interval_seconds", 2.0
+            ),
             # Retry and timeout settings
             max_retries=cfg.get("retries", {}).get("max_attempts", 10),
             wait_time_after_creation=cfg.get("retries", {}).get(
@@ -232,6 +244,7 @@ async def start_bot(config_path: str):
                 "max_concurrent_positions", 4
             ),
             risk_limits=_risk_limits_from_config(cfg),
+            execution_config=cfg.get("execution"),
         )
 
         await trader.start()

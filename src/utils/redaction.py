@@ -26,6 +26,8 @@ _SENSITIVE_KEY_PARTS = (
     "telegram_token",
     "token",
     "wallet_secret",
+    "x_jito_auth",
+    "x_token",
 )
 _PLACEHOLDER_MARKERS = ("YOUR_", "PLACEHOLDER", "...")
 _URL_PATTERN = re.compile(r"\b(?:https?|wss?|grpc)://[^\s<>\"']+", re.IGNORECASE)
@@ -143,9 +145,21 @@ def endpoint_identifier(endpoint: str | None) -> str:
         authority = f"{parts.scheme}://{host}"
         if parts.port is not None:
             authority = f"{authority}:{parts.port}"
+        safe_parts = urlsplit(redact_url(parseable))
+        query_keys = sorted(key for key, _value in parse_qsl(parts.query))
+        identity_material = urlunsplit(
+            (
+                safe_parts.scheme,
+                safe_parts.netloc,
+                safe_parts.path,
+                urlencode([(key, "") for key in query_keys]),
+                "",
+            )
+        )
     except (TypeError, ValueError):
         authority = "endpoint"
-    fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        identity_material = "invalid-endpoint"
+    fingerprint = hashlib.sha256(identity_material.encode("utf-8")).hexdigest()[:12]
     return f"{authority}#{fingerprint}"
 
 

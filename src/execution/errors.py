@@ -25,6 +25,13 @@ class ErrorClassification(StrEnum):
     UNSUPPORTED_QUOTE_TOKEN = "unsupported_quote_token"
     MALFORMED_EVENT_STATE = "malformed_event_state"
     RISK_LIMIT_EXCEEDED = "risk_limit_exceeded"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PROVIDER_AUTHENTICATION_FAILURE = "provider_authentication_failure"
+    BUNDLE_REJECTED = "bundle_rejected"
+    TIP_TOO_LOW = "tip_too_low"
+    DUPLICATE_SIGNATURE = "duplicate_signature"
+    LEADER_ROUTING_FAILURE = "leader_routing_failure"
+    UNSUPPORTED_PROVIDER = "unsupported_provider"
     UNKNOWN = "unknown"
 
 

@@ -5,13 +5,13 @@ Final cleanup removing all platform-specific hardcoding.
 
 import asyncio
 from decimal import ROUND_DOWN, Decimal
-from time import monotonic
+from time import monotonic, monotonic_ns
 from typing import Awaitable, Callable
 
 from solders.pubkey import Pubkey
 
 from application.risk import FeeExposure, RiskContext, RiskService
-from core.client import SolanaClient
+from core.client import SolanaClient, maximum_ata_rent_lamports
 from core.priority_fee.manager import PriorityFeeManager
 from core.pubkeys import (
     TOKEN_DECIMALS,
@@ -32,7 +32,14 @@ from domain.amounts import (
     priority_fee_lamports_ceiling,
 )
 from domain.lifecycle import ExecutionState
-from domain.quotes import ExecutionPlan, ExecutionSide, quote_buy, quote_sell
+from domain.quotes import (
+    ExecutionPlan,
+    ExecutionResult,
+    ExecutionSide,
+    quote_buy,
+    quote_sell,
+)
+from execution.detection import detection_for
 from execution.errors import ErrorClassification
 from execution.telemetry import ExecutionTelemetry
 from interfaces.core import AddressProvider, Platform, TokenInfo
@@ -45,6 +52,46 @@ logger = get_logger(__name__)
 ExposureProvider = Callable[[Pubkey, Pubkey], Awaitable[tuple[int, int]]]
 TelemetryRecorder = Callable[[ExecutionTelemetry], None]
 SubmissionRecorder = Callable[[object, object | None], None]
+
+
+def _apply_priority_fee_telemetry(
+    telemetry: ExecutionTelemetry, manager: PriorityFeeManager
+) -> None:
+    """Copy the latest fee-estimate provenance into the execution record."""
+    selection = getattr(manager, "last_selection", None)
+    if selection is None:
+        return
+    telemetry.priority_fee_estimate_micro_lamports = (
+        selection.estimated_micro_lamports_per_cu
+    )
+    telemetry.priority_fee_estimation_source = selection.source
+    telemetry.priority_fee_estimate_age_ms = selection.estimate_age_ms
+    telemetry.priority_fee_estimation_latency_ms = selection.estimation_latency_ms
+
+
+def _apply_execution_result_telemetry(
+    telemetry: ExecutionTelemetry,
+    result: ExecutionResult,
+    quote_mint: Pubkey,
+) -> None:
+    """Copy authoritative costs without mixing quote and SOL denominations."""
+    telemetry.rent_lamports = result.rent_lamports
+    telemetry.jito_tip_lamports = result.delivery_tip_lamports
+    if (
+        result.network_fee_lamports is not None
+        and result.priority_fee_lamports is not None
+        and result.network_fee_lamports >= result.priority_fee_lamports
+    ):
+        telemetry.base_network_fee_lamports = (
+            result.network_fee_lamports - result.priority_fee_lamports
+        )
+    else:
+        telemetry.base_network_fee_lamports = None
+    if result.protocol_fee_raw is not None:
+        telemetry.attributes["protocol_fee_raw"] = result.protocol_fee_raw
+    if result.creator_fee_raw is not None:
+        telemetry.attributes["creator_fee_raw"] = result.creator_fee_raw
+    telemetry.attributes["fee_quote_mint"] = str(quote_mint)
 
 
 def _fraction_to_basis_points(value: float) -> BasisPoints:
@@ -266,6 +313,7 @@ class PlatformAwareBuyer(Trader):
         submission_recorder: SubmissionRecorder | None = None,
     ) -> TradeResult:
         """Execute buy operation using platform-specific implementations."""
+        telemetry: ExecutionTelemetry | None = None
         try:
             previously_confirmed = False
             if existing_signature is not None:
@@ -303,6 +351,13 @@ class PlatformAwareBuyer(Trader):
                             ErrorClassification.ON_CHAIN_PROGRAM_FAILURE
                         ),
                     )
+            if not previously_confirmed:
+                telemetry = ExecutionTelemetry(
+                    execution_id=logical_execution_id
+                    or f"buy:{token_info.mint}:{monotonic()}"
+                )
+                telemetry.logical_trade_id = logical_execution_id
+                telemetry.apply_detection(detection_for(token_info))
             # Get platform-specific implementations
             implementations = get_platform_implementations(
                 token_info.platform, self.client
@@ -340,6 +395,10 @@ class PlatformAwareBuyer(Trader):
 
                 # Regular behavior with RPC call
                 # Fetch pool state to get price and mayhem mode status
+                refresh_started = monotonic_ns()
+                detection = detection_for(token_info)
+                if detection is not None:
+                    detection.authoritative_refresh_started_mono_ns = refresh_started
                 if token_info.platform == Platform.PUMP_FUN and hasattr(
                     curve_manager, "get_pool_state_and_fee_schedule"
                 ):
@@ -356,6 +415,14 @@ class PlatformAwareBuyer(Trader):
                     )
                 else:
                     pool_state = await curve_manager.get_pool_state(pool_address)
+                refresh_completed = monotonic_ns()
+                if detection is not None:
+                    detection.authoritative_refresh_completed_mono_ns = (
+                        refresh_completed
+                    )
+                    detection.account_read_duration_ms = (
+                        refresh_completed - refresh_started
+                    ) / 1_000_000
                 token_price_sol = pool_state.get("price_per_token")
 
                 # Validate price_per_token is present and positive
@@ -395,6 +462,7 @@ class PlatformAwareBuyer(Trader):
             # trade: extreme_fast_mode fixes the token count and back-derives an
             # implied price, while the regular path fixes the spend and derives
             # the token count from the curve price.
+            quote_started = monotonic_ns()
             buy_quote = None
             execution_plan = None
             if self.extreme_fast_mode:
@@ -436,8 +504,13 @@ class PlatformAwareBuyer(Trader):
                 max_quote_amount_raw = int(
                     quote_amount * quote_unit * (1 + self.slippage)
                 )
+            if telemetry is not None:
+                telemetry.attributes["quote_generation_ms"] = (
+                    monotonic_ns() - quote_started
+                ) / 1_000_000
 
             # Build buy instructions using platform-specific builder
+            instruction_build_started = monotonic_ns()
             instructions = await instruction_builder.build_buy_instruction(
                 token_info,
                 self.wallet.pubkey,
@@ -445,6 +518,13 @@ class PlatformAwareBuyer(Trader):
                 minimum_token_amount_raw,  # minimum_amount_out (tokens)
                 address_provider,
             )
+            if telemetry is not None:
+                telemetry.attributes["instruction_construction_ms"] = (
+                    monotonic_ns() - instruction_build_started
+                ) / 1_000_000
+                telemetry.maximum_rent_exposure_lamports = maximum_ata_rent_lamports(
+                    instructions
+                )
 
             # Get accounts for priority fee calculation
             priority_accounts = instruction_builder.get_required_accounts_for_buy(
@@ -463,6 +543,8 @@ class PlatformAwareBuyer(Trader):
             priority_fee = await self.priority_fee_manager.calculate_priority_fee(
                 priority_accounts
             )
+            if telemetry is not None:
+                _apply_priority_fee_telemetry(telemetry, self.priority_fee_manager)
             compute_unit_limit = instruction_builder.get_buy_compute_unit_limit(
                 self._get_cu_override("buy", token_info.platform)
             )
@@ -480,14 +562,11 @@ class PlatformAwareBuyer(Trader):
                 success = True
                 telemetry = None
             else:
-                telemetry = ExecutionTelemetry(
-                    execution_id=(
-                        execution_plan.logical_execution_id
-                        if execution_plan is not None
-                        else logical_execution_id
-                        or f"buy:{token_info.mint}:{monotonic()}"
-                    )
-                )
+                if telemetry is None:
+                    raise RuntimeError("buy execution telemetry was not initialized")
+                if execution_plan is not None:
+                    telemetry.execution_id = execution_plan.logical_execution_id
+                telemetry.apply_detection(detection_for(token_info))
                 send_options = {
                     "skip_preflight": True,
                     "max_retries": self.max_retries,
@@ -513,7 +592,7 @@ class PlatformAwareBuyer(Trader):
                         telemetry.error_classification = (
                             observation.error_classification
                         )
-                if self.telemetry_recorder is not None:
+                if not success and self.telemetry_recorder is not None:
                     self.telemetry_recorder(telemetry)
 
             if success:
@@ -543,6 +622,10 @@ class PlatformAwareBuyer(Trader):
                         )
                     tokens_raw = actual_execution.token_delta_raw
                     quote_spent = actual_execution.quote_delta_raw
+                    if telemetry is not None:
+                        _apply_execution_result_telemetry(
+                            telemetry, actual_execution, quote_mint
+                        )
                 else:
                     tokens_raw = None
                     quote_spent = None
@@ -585,6 +668,9 @@ class PlatformAwareBuyer(Trader):
                         f"quote_spent={quote_spent} (tx: {tx_signature}). "
                         f"The transaction may have failed on-chain — check explorer."
                     )
+
+                if telemetry is not None and self.telemetry_recorder is not None:
+                    self.telemetry_recorder(telemetry)
 
                 return TradeResult(
                     success=True,
@@ -639,7 +725,7 @@ class PlatformAwareBuyer(Trader):
         priority_fee = priority_fee_lamports_ceiling(
             MicroLamportsPerCU(priority_fee_micro_lamports), compute_unit_limit
         )
-        rent = Lamports(self.client.maximum_ata_rent_lamports(instructions))
+        rent = Lamports(maximum_ata_rent_lamports(instructions))
         existing, aggregate = (
             await self.exposure_provider(plan.token_mint, plan.quote_mint)
             if self.exposure_provider is not None
@@ -657,6 +743,7 @@ class PlatformAwareBuyer(Trader):
                     Lamports(base_fee) if base_fee is not None else None,
                     priority_fee,
                     rent,
+                    jito_tip=Lamports(getattr(self.client, "jito_tip_lamports", 0)),
                 ),
                 native_trade_spend_lamports=(
                     plan.input_raw if is_sol_paired(plan.quote_mint) else 0
@@ -722,6 +809,10 @@ class PlatformAwareBuyer(Trader):
             from listener-guessed defaults tends to revert on-chain
             (issue #170: 0x1770 / 0x7d6 / pool 3012), which still costs the fee
         """
+        detection = detection_for(token_info)
+        refresh_started = monotonic_ns()
+        if detection is not None:
+            detection.authoritative_refresh_started_mono_ns = refresh_started
         try:
             pool_address = self._get_pool_address(token_info, address_provider)
             # Geyser/logs fire on processed, so the BC is typically readable in
@@ -734,10 +825,23 @@ class PlatformAwareBuyer(Trader):
                 budget_seconds=self.curve_refresh_budget,
             )
         except Exception as e:  # noqa: BLE001
+            refresh_completed = monotonic_ns()
+            if detection is not None:
+                detection.authoritative_refresh_completed_mono_ns = refresh_completed
+                detection.account_read_duration_ms = (
+                    refresh_completed - refresh_started
+                ) / 1_000_000
             return (
                 f"Curve state unreadable within {self.curve_refresh_budget:.1f}s "
                 f"({e}); skipping buy rather than submitting with guessed accounts"
             )
+
+        refresh_completed = monotonic_ns()
+        if detection is not None:
+            detection.authoritative_refresh_completed_mono_ns = refresh_completed
+            detection.account_read_duration_ms = (
+                refresh_completed - refresh_started
+            ) / 1_000_000
 
         token_info.is_mayhem_mode = pool_state.get(
             "is_mayhem_mode", token_info.is_mayhem_mode
@@ -923,6 +1027,7 @@ class PlatformAwareSeller(Trader):
                 "Pass the price from buy result to avoid RPC delays."
             )
 
+        telemetry: ExecutionTelemetry | None = None
         try:
             previously_confirmed = False
             if existing_signature is not None:
@@ -958,6 +1063,13 @@ class PlatformAwareSeller(Trader):
                         error_message="Previous sell failed on chain",
                         error_classification=ErrorClassification.ON_CHAIN_PROGRAM_FAILURE,
                     )
+            if not previously_confirmed:
+                telemetry = ExecutionTelemetry(
+                    execution_id=logical_execution_id
+                    or f"sell:{token_info.mint}:{monotonic()}"
+                )
+                telemetry.logical_trade_id = logical_execution_id
+                telemetry.apply_detection(detection_for(token_info))
 
             # Get platform-specific implementations
             implementations = get_platform_implementations(
@@ -977,6 +1089,7 @@ class PlatformAwareSeller(Trader):
             # fee_recipient differs in mayhem mode — both can change between
             # buy and sell, so re-read from chain instead of trusting create-time
             # flags carried in token_info.
+            refresh_started = monotonic_ns()
             try:
                 pool_address = self._get_pool_address(token_info, address_provider)
                 # Retry rather than reading once at `confirmed`: a node serving a
@@ -1033,6 +1146,11 @@ class PlatformAwareSeller(Trader):
                     f"using token_info values is_mayhem_mode={token_info.is_mayhem_mode}, "
                     f"is_cashback_coin={token_info.is_cashback_coin}"
                 )
+            finally:
+                if telemetry is not None:
+                    telemetry.attributes["account_state_refresh_ms"] = (
+                        monotonic_ns() - refresh_started
+                    ) / 1_000_000
 
             quote_unit = quote_units_per_token(quote_mint)
             quote_label = _quote_symbol(quote_mint)
@@ -1057,6 +1175,7 @@ class PlatformAwareSeller(Trader):
                     error_message="No tokens to sell",
                 )
 
+            quote_started = monotonic_ns()
             if (
                 token_info.platform == Platform.PUMP_FUN
                 and pool_state is not None
@@ -1091,6 +1210,10 @@ class PlatformAwareSeller(Trader):
                     1,
                     int((expected_quote_output * (1 - self.slippage)) * quote_unit),
                 )
+            if telemetry is not None:
+                telemetry.attributes["quote_generation_ms"] = (
+                    monotonic_ns() - quote_started
+                ) / 1_000_000
             logger.info(
                 f"Selling {token_balance_decimal} tokens on {token_info.platform.value}"
             )
@@ -1104,6 +1227,7 @@ class PlatformAwareSeller(Trader):
             )
 
             # Build sell instructions using platform-specific builder
+            instruction_build_started = monotonic_ns()
             instructions = await instruction_builder.build_sell_instruction(
                 token_info,
                 self.wallet.pubkey,
@@ -1111,6 +1235,13 @@ class PlatformAwareSeller(Trader):
                 min_quote_output,  # minimum_amount_out (raw quote units)
                 address_provider,
             )
+            if telemetry is not None:
+                telemetry.attributes["instruction_construction_ms"] = (
+                    monotonic_ns() - instruction_build_started
+                ) / 1_000_000
+                telemetry.maximum_rent_exposure_lamports = maximum_ata_rent_lamports(
+                    instructions
+                )
 
             # Get accounts for priority fee calculation
             priority_accounts = instruction_builder.get_required_accounts_for_sell(
@@ -1121,6 +1252,8 @@ class PlatformAwareSeller(Trader):
             priority_fee = await self.priority_fee_manager.calculate_priority_fee(
                 priority_accounts
             )
+            if telemetry is not None:
+                _apply_priority_fee_telemetry(telemetry, self.priority_fee_manager)
             compute_unit_limit = instruction_builder.get_sell_compute_unit_limit(
                 self._get_cu_override("sell", token_info.platform)
             )
@@ -1137,14 +1270,11 @@ class PlatformAwareSeller(Trader):
                 success = True
                 telemetry = None
             else:
-                telemetry = ExecutionTelemetry(
-                    execution_id=(
-                        execution_plan.logical_execution_id
-                        if execution_plan is not None
-                        else logical_execution_id
-                        or f"sell:{token_info.mint}:{monotonic()}"
-                    )
-                )
+                if telemetry is None:
+                    raise RuntimeError("sell execution telemetry was not initialized")
+                if execution_plan is not None:
+                    telemetry.execution_id = execution_plan.logical_execution_id
+                telemetry.apply_detection(detection_for(token_info))
                 send_options = {
                     "skip_preflight": True,
                     "max_retries": self.max_retries,
@@ -1170,7 +1300,7 @@ class PlatformAwareSeller(Trader):
                         telemetry.error_classification = (
                             observation.error_classification
                         )
-                if self.telemetry_recorder is not None:
+                if not success and self.telemetry_recorder is not None:
                     self.telemetry_recorder(telemetry)
 
             if success:
@@ -1201,6 +1331,12 @@ class PlatformAwareSeller(Trader):
                         )
                         / Decimal(str(token_balance_decimal))
                     )
+                    if telemetry is not None:
+                        _apply_execution_result_telemetry(
+                            telemetry, actual_execution, quote_mint
+                        )
+                if telemetry is not None and self.telemetry_recorder is not None:
+                    self.telemetry_recorder(telemetry)
                 return TradeResult(
                     success=True,
                     platform=token_info.platform,
@@ -1280,7 +1416,8 @@ class PlatformAwareSeller(Trader):
                         MicroLamportsPerCU(priority_fee_micro_lamports),
                         compute_unit_limit,
                     ),
-                    Lamports(self.client.maximum_ata_rent_lamports(instructions)),
+                    Lamports(maximum_ata_rent_lamports(instructions)),
+                    jito_tip=Lamports(getattr(self.client, "jito_tip_lamports", 0)),
                 ),
             ),
         )

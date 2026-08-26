@@ -20,12 +20,20 @@ class FeeExposure:
     base_fee: Lamports | None
     priority_fee: Lamports
     rent: Lamports
+    jito_tip: Lamports = field(default_factory=lambda: Lamports(0))
+    other_known_cost: Lamports = field(default_factory=lambda: Lamports(0))
 
     @property
     def maximum_known_lamports(self) -> int | None:
         if self.base_fee is None:
             return None
-        return self.base_fee.value + self.priority_fee.value + self.rent.value
+        return (
+            self.base_fee.value
+            + self.priority_fee.value
+            + self.rent.value
+            + self.jito_tip.value
+            + self.other_known_cost.value
+        )
 
 
 @dataclass(slots=True)

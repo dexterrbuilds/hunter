@@ -1,7 +1,8 @@
 # Hunter architecture
 
-Milestone 2 introduces durable domain and application boundaries while keeping
-the audited standard Solana JSON-RPC path active. Pump.fun instruction builders,
+Milestone 3 adds measured provider routing around the Milestone 2 domain and
+application boundaries. The audited standard Solana JSON-RPC path remains the
+default when no `execution` section is configured. Pump.fun instruction builders,
 account ordering, discriminators, PDA/ATA derivation, program IDs, and vendored
 IDLs remain the Milestone 1 implementations.
 
@@ -20,7 +21,11 @@ listeners / future interfaces
             |
  account | blockhash | builder | signer | submitter | confirmation | inspector
             |
-       standard Solana JSON-RPC
+         signed transaction identity
+              /       |       \
+       standard RPC  Helius  Jito
+              \       |       /
+            confirmation observer
 
 strategies -> exit decisions -> SellService
 positions <-> PositionService <-> SQLitePositionStore
@@ -160,9 +165,17 @@ position does not block detection. Monitor keys prevent duplicate ownership and
 retry by requeueing within the same bounded pool. Shutdown cancels and joins
 owned workers before closing persistence/RPC resources.
 
-The standard RPC path records UTC correlation timestamps and monotonic
+The standard RPC path and opt-in provider adapters record UTC correlation timestamps and monotonic
 nanosecond timestamps for request, build, sign, submit, RPC response, signature,
 and observed commitment stages. It also records sanitized provider/endpoint
 identity, slots, blockhash validity, transaction size, compute limit/price,
-priority fee, signature, and typed error. Completed snapshots are persisted
-after the confirmation hot path; credential-bearing endpoints are never stored.
+priority fee, signature, and typed error. Per-provider attempts share one
+signature unless a tip created an explicitly distinct variant. Completed
+snapshots and provider attempts are queued in memory and persisted by a worker
+after the submission hot path; credential-bearing endpoints are never stored.
+
+Role-specific standard endpoints may serve account reads, blockhashes,
+submission, confirmation, or WebSockets. Submission routing supports single,
+race, hedged, and safe fallback modes. See
+[execution-providers.md](execution-providers.md) and
+[landing-metrics.md](landing-metrics.md).

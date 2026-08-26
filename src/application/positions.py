@@ -15,6 +15,12 @@ from domain.quotes import ExecutionResult, ExecutionSide
 from storage.sqlite import SQLitePositionStore, StoredPosition
 
 
+def _other_execution_cost(result: ExecutionResult) -> int | None:
+    if result.rent_lamports is None:
+        return None
+    return result.rent_lamports + result.delivery_tip_lamports
+
+
 class WalletBalanceReader(Protocol):
     async def get_token_balance_raw(
         self, owner: Pubkey, mint: Pubkey, token_program: Pubkey | None = None
@@ -82,7 +88,7 @@ class PositionService:
                 quote_cost_raw=result.quote_delta_raw,
                 network_fee_lamports=result.network_fee_lamports,
                 priority_fee_lamports=result.priority_fee_lamports,
-                other_cost_lamports=result.rent_lamports,
+                other_cost_lamports=_other_execution_cost(result),
             )
         )
         position = StoredPosition(accounting, strategy_metadata or {})
@@ -95,7 +101,7 @@ class PositionService:
             quote_amount_raw=result.quote_delta_raw,
             network_fee_lamports=result.network_fee_lamports,
             priority_fee_lamports=result.priority_fee_lamports,
-            other_cost_lamports=result.rent_lamports,
+            other_cost_lamports=_other_execution_cost(result),
         )
         return position
 
@@ -119,7 +125,7 @@ class PositionService:
                 quote_proceeds_raw=result.quote_delta_raw,
                 network_fee_lamports=result.network_fee_lamports,
                 priority_fee_lamports=result.priority_fee_lamports,
-                other_cost_lamports=result.rent_lamports,
+                other_cost_lamports=_other_execution_cost(result),
             ),
             quote_is_native_sol=is_sol_paired(position.accounting.quote_mint),
         )
@@ -137,7 +143,7 @@ class PositionService:
             quote_amount_raw=result.quote_delta_raw,
             network_fee_lamports=result.network_fee_lamports,
             priority_fee_lamports=result.priority_fee_lamports,
-            other_cost_lamports=result.rent_lamports,
+            other_cost_lamports=_other_execution_cost(result),
         )
         self.store.transition_position(
             position_id,

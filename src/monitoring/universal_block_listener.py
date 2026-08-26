@@ -6,11 +6,14 @@ import asyncio
 import base64
 import json
 from collections.abc import Awaitable, Callable
+from time import monotonic_ns
 
 import websockets
 from solders.transaction import VersionedTransaction
 
 from core.client import SolanaClient
+from execution.detection import record_detection
+from execution.telemetry import utc_now
 from interfaces.core import Platform, TokenInfo
 from monitoring.base_listener import BaseTokenListener
 from platforms import get_platform_implementations, platform_factory
@@ -216,6 +219,8 @@ class UniversalBlockListener(BaseTokenListener):
         """
         try:
             response = await asyncio.wait_for(websocket.recv(), timeout=30)
+            observed_at = utc_now()
+            observed_mono_ns = monotonic_ns()
             data = json.loads(response)
 
             # Handle subscription errors
@@ -241,7 +246,19 @@ class UniversalBlockListener(BaseTokenListener):
                 return None
 
             # Process all transactions in the block for token creations
-            return self._process_block_transactions(block["transactions"])
+            token_info = self._process_block_transactions(block["transactions"])
+            if token_info is not None:
+                slot = block_data.get("context", {}).get("slot")
+                record_detection(
+                    token_info,
+                    source="solana_blocks",
+                    event_slot=slot,
+                    transaction_slot=slot,
+                    launch_slot=slot,
+                    observed_at=observed_at,
+                    observed_mono_ns=observed_mono_ns,
+                )
+            return token_info
 
         except TimeoutError:
             logger.debug("No data received for 30 seconds")

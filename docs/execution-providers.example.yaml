@@ -1,0 +1,68 @@
+# Reference fragment only. Existing bot files remain unchanged unless this
+# section is copied deliberately. Live submission is disabled by default.
+execution:
+  enabled: false
+  mode: single # single | race | hedged | fallback
+  hedge_delay_ms: 75
+  maximum_blockhash_age_ms: 30000
+  maximum_combined_fee_lamports: 1000000
+  execution_variant: standard # standard | jito_tipped | helius_sender_tipped
+  jito_tip_lamports: 0
+  jito_tip_account: null
+  # Warning-only budgets. They never reject a trade.
+  latency_budgets:
+    detection_processing_ms: 25
+    quote_generation_ms: 10
+    blockhash_retrieval_ms: 50
+    transaction_build_ms: 10
+    signing_ms: 5
+    submission_rtt_ms: 150
+  providers:
+    - id: primary-read
+      kind: standard_rpc
+      endpoint: "https://rpc-provider.invalid/?api-key=YOUR_RPC_API_KEY"
+      priority: 10
+      roles: [account_read, blockhash, confirm]
+      enabled: false
+    - id: primary-write
+      kind: standard_rpc
+      endpoint: "https://rpc-provider.invalid/?api-key=YOUR_RPC_API_KEY"
+      priority: 10
+      roles: [submit]
+      enabled: false
+      skip_preflight: true
+      max_retries: 0
+    - id: websocket
+      kind: standard_rpc
+      endpoint: "wss://rpc-provider.invalid/?api-key=YOUR_RPC_API_KEY"
+      priority: 10
+      roles: [websocket]
+      enabled: false
+    - id: helius-sender
+      kind: helius_sender
+      endpoint: "https://sender.helius-rpc.com/fast"
+      warmup_endpoint: "https://sender.helius-rpc.com/ping"
+      priority: 20
+      roles: [submit]
+      enabled: false
+      minimum_tip_lamports: 200000
+      maximum_tip_lamports: 500000
+    - id: jito-mainnet
+      kind: jito
+      endpoint: "https://mainnet.block-engine.jito.wtf/api/v1/transactions"
+      priority: 30
+      roles: [submit]
+      enabled: false
+      bundle_only: false
+      minimum_tip_lamports: 1000
+      maximum_tip_lamports: 500000
+
+priority_fees:
+  # Existing fixed/dynamic keys remain compatible. Optional strategy values:
+  # fixed | dynamic | cached_dynamic | periodic_dynamic | provider_estimated
+  strategy: fixed
+  cache_ttl_seconds: 5.0
+  refresh_interval_seconds: 2.0
+
+benchmark:
+  allow_live_submission: false

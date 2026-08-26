@@ -31,7 +31,11 @@ from core.pubkeys import (
 from core.wallet import Wallet
 from domain.lifecycle import ExecutionState, PositionStatus, is_retryable
 from domain.quotes import ExecutionSide
+from execution.detection import detection_for
 from execution.errors import ErrorClassification
+from execution.providers.config import ProviderRole
+from execution.providers.factory import routing_config_from_dict
+from execution.telemetry_sink import AsyncTelemetrySink
 from interfaces.core import Platform, TokenInfo
 from monitoring.listener_factory import ListenerFactory
 from monitoring.position_monitor import MonitorRetry, PositionMonitorManager
@@ -137,6 +141,9 @@ class UniversalTrader:
         fixed_priority_fee: int = 200_000,
         extra_priority_fee: float = 0.0,
         hard_cap_prior_fee: int = 200_000,
+        priority_fee_strategy: str | None = None,
+        priority_fee_cache_ttl_seconds: float = 5.0,
+        priority_fee_refresh_interval_seconds: float = 2.0,
         # Retry and timeout settings
         max_retries: int = 3,
         wait_time_after_creation: int = 15,
@@ -161,10 +168,48 @@ class UniversalTrader:
         database_path: str = "data/hunter.sqlite3",
         max_concurrent_positions: int = 4,
         risk_limits: RiskLimits | None = None,
+        execution_config: dict | None = None,
     ):
         """Initialize the universal trader."""
         # Core components
-        self.solana_client = SolanaClient(rpc_endpoint, max_rps=max_rps)
+        routing_config = routing_config_from_dict(execution_config)
+        if (
+            routing_config.enabled
+            and routing_config.jito_tip_lamports
+            and (risk_limits is None or not risk_limits.enforce)
+        ):
+            raise ValueError("tipped execution requires active RiskService enforcement")
+        if (
+            routing_config.enabled
+            and routing_config.jito_tip_lamports
+            and not risk_limits.reject_unknown_base_fee
+        ):
+            raise ValueError("tipped execution cannot accept an unknown base fee")
+        websocket_endpoints = (
+            routing_config.for_role(ProviderRole.WEBSOCKET)
+            if routing_config.enabled
+            else ()
+        )
+        effective_wss_endpoint = (
+            websocket_endpoints[0].endpoint if websocket_endpoints else wss_endpoint
+        )
+        maximum_blockhash_age_ms = (
+            routing_config.maximum_blockhash_age_ms
+            if routing_config.enabled
+            else 60_000
+        )
+        self.solana_client = SolanaClient(
+            rpc_endpoint,
+            max_rps=max_rps,
+            maximum_blockhash_age_ms=maximum_blockhash_age_ms,
+        )
+        if routing_config.enabled:
+            self.solana_client.configure_execution_routing(
+                routing_config,
+                execution_variant=routing_config.execution_variant,
+                jito_tip_lamports=routing_config.jito_tip_lamports,
+                jito_tip_account=routing_config.jito_tip_account,
+            )
         self.wallet = Wallet(private_key)
         self.priority_fee_manager = PriorityFeeManager(
             client=self.solana_client,
@@ -173,8 +218,12 @@ class UniversalTrader:
             fixed_fee=fixed_priority_fee,
             extra_fee=extra_priority_fee,
             hard_cap=hard_cap_prior_fee,
+            strategy=priority_fee_strategy,
+            cache_ttl_seconds=priority_fee_cache_ttl_seconds,
+            refresh_interval_seconds=priority_fee_refresh_interval_seconds,
         )
         self.position_store = SQLitePositionStore(database_path)
+        self.telemetry_sink = AsyncTelemetrySink(self.position_store)
         self.position_service = PositionService(self.position_store)
         self.risk_service = RiskService(risk_limits)
         self.max_concurrent_positions = max(1, max_concurrent_positions)
@@ -246,7 +295,7 @@ class UniversalTrader:
         # Initialize the appropriate listener with platform filtering
         self.token_listener = ListenerFactory.create_listener(
             listener_type=listener_type,
-            wss_endpoint=wss_endpoint,
+            wss_endpoint=effective_wss_endpoint,
             geyser_endpoint=geyser_endpoint,
             geyser_api_token=geyser_api_token,
             geyser_auth_type=geyser_auth_type,
@@ -332,13 +381,18 @@ class UniversalTrader:
         try:
             execution = self.position_store.get_execution(telemetry.execution_id)
             attempt = execution.submission_attempt if execution is not None else 1
-            self.position_store.save_telemetry(telemetry, attempt=max(1, attempt))
+            if self.telemetry_sink.running:
+                self.telemetry_sink.record_nowait(telemetry, max(1, attempt))
+            else:
+                self.position_store.save_telemetry(telemetry, attempt=max(1, attempt))
         except Exception:  # noqa: BLE001
             logger.exception("Failed to persist execution telemetry")
 
     async def start(self) -> None:
         """Start the trading bot and listen for new tokens."""
         logger.info(f"Starting Universal Trader for {self.platform.value}")
+        await self.telemetry_sink.start()
+        await self.priority_fee_manager.start()
         logger.info(
             f"Match filter: {self.match_string if self.match_string else 'None'}"
         )
@@ -368,6 +422,13 @@ class UniversalTrader:
             logger.info(f"RPC warm-up successful (getHealth passed: {health_resp})")
         except Exception as e:
             logger.warning(f"RPC warm-up failed: {e!s}")
+
+        provider_warmup = await self.solana_client.warm_execution_providers()
+        if provider_warmup:
+            logger.info(
+                "Execution provider connection warm-up: %s",
+                provider_warmup,
+            )
 
         await self.position_monitor_manager.start()
         await self._recover_positions()
@@ -493,7 +554,9 @@ class UniversalTrader:
             self.token_timestamps.pop(key, None)
 
         await self.position_monitor_manager.stop()
+        await self.priority_fee_manager.close()
         await self.solana_client.close()
+        await self.telemetry_sink.close()
         self.position_store.close()
 
     async def _recover_positions(self) -> None:
@@ -744,6 +807,9 @@ class UniversalTrader:
                 token_key = str(token_info.mint)
                 self.processed_tokens.add(token_key)
                 self.queued_tokens.discard(token_key)
+                detection = detection_for(token_info)
+                if detection is not None:
+                    detection.mark_processing_started()
 
                 # Check if token is still "fresh"
                 current_time = monotonic()
@@ -774,6 +840,12 @@ class UniversalTrader:
     async def _handle_token(self, token_info: TokenInfo) -> None:
         """Handle a new token creation event."""
         try:
+            detection = detection_for(token_info)
+            if (
+                detection is not None
+                and detection.hunter_processing_started_mono_ns is None
+            ):
+                detection.mark_processing_started()
             # Validate that token is for our platform
             if token_info.platform != self.platform:
                 logger.warning(
@@ -814,6 +886,8 @@ class UniversalTrader:
                 f"{token_quote_mint} worth of {token_info.symbol} "
                 f"on {token_info.platform.value}..."
             )
+            if detection is not None:
+                detection.mark_trade_request_created()
             buy_result: TradeResult = await self._execute_managed_buy(token_info)
 
             if buy_result.success:

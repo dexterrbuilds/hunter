@@ -1,7 +1,29 @@
 # Known risks
 
-Hunter remains pre-production software. This list distinguishes Milestone 2
+Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
+
+## Resolved or materially improved in Milestone 3
+
+- Standard RPC, Helius Sender, Jito single-transaction delivery, and multiple
+  generic RPC transports have isolated adapters and normalized results.
+- Compatible broadcast transports reuse one signed transaction identity;
+  tipped transactions are explicitly separate variants.
+- Single, race, hedged, and classified fallback routing preserve Milestone 2
+  idempotency and never rebuild solely because a provider timed out.
+- Account-read, blockhash, submit, confirmation, and WebSocket roles can use
+  separately configured standard endpoints.
+- Provider acknowledgement, landing, detector timing, blockhash age, fee
+  provenance, and slot-distance metrics are persisted without synchronous
+  telemetry writes in the submission path.
+- Fixed, cached dynamic, periodically refreshed dynamic, and provider-estimate
+  priority-fee boundaries are available; existing fixed/dynamic settings remain
+  compatible.
+- Jito/Helius tips are bounded, counted separately, limited to one instruction,
+  and included in known combined fee exposure.
+- Provider health uses bounded rolling evidence, refuses to use tiny samples,
+  and only reorders non-race candidates when every endpoint has enough recent
+  data; no endpoint is permanently excluded.
 
 ## Resolved or materially improved in Milestone 2
 
@@ -44,11 +66,27 @@ improvements from risks that remain open; it is not exhaustive.
 
 ## Remaining execution and recovery risks
 
-- **Single-provider dependency remains.** Reads, submission, inspection, and
-  confirmation use the configured standard Solana JSON-RPC endpoint.
-- **No alternate observer or rebroadcast service exists.** Ambiguous outcomes
-  intentionally stop/reconcile rather than guessing; this favors duplicate-sale
-  safety over automatic liveness.
+- **Alternate providers are opt-in and unbenchmarked locally.** Shipping an
+  adapter does not prove it is faster or more reliable from the operator's
+  region. Standard RPC remains the default.
+- **Jito multi-transaction bundles are not implemented.** `bundleOnly` is the
+  documented single-transaction mode; Hunter has not established an atomic
+  multi-transaction Pump.fun requirement.
+- **Tip account selection is operator-configured.** Hunter does not fetch Jito
+  tip accounts synchronously on the trade hot path. A stale/invalid configured
+  account causes provider rejection rather than being guessed.
+- **Tip attribution after an interrupted confirmation can require review.** The
+  immediate execution path records a configured delivery tip separately from
+  rent. If Hunter restarts before that telemetry snapshot is durable and the
+  operator changes the delivery configuration, the wallet's native balance
+  effect still preserves total accounting cost, but automatic reconstruction
+  may not be able to label the old transfer as tip versus another native cost.
+- **Submission slot is an observation bound.** It is read asynchronously after
+  acknowledgement and may be later than actual provider ingress. Landing slot
+  is authoritative; ingress timing is not.
+- **Confirmation is still RPC-observed.** Multi-provider submission does not
+  make temporary status/metadata invisibility conclusive. Ambiguous outcomes
+  still stop/reconcile rather than authorize a fresh signature.
 - **A crash between chain landing and signature persistence is still possible.**
   Hunter persists immediately after the RPC response, but no local system can
   durably record a response it never received. Wallet reconciliation prevents
@@ -63,8 +101,8 @@ improvements from risks that remain open; it is not exhaustive.
 - **Confirmation relies on RPC semantics.** Temporary `getTransaction`
   invisibility is handled, but prolonged provider inconsistency can remain
   accepted-but-not-observed.
-- **Dynamic priority fees add a hot-path RPC read.** No latency optimization or
-  provider benchmark is claimed in Milestone 2.
+- **Synchronous dynamic priority mode still adds a hot-path RPC read.** Cached
+  and periodic modes avoid it, but must be enabled and measured by the operator.
 
 ## Remaining protocol and throughput risks
 
@@ -80,8 +118,15 @@ improvements from risks that remain open; it is not exhaustive.
   after ordinary scheduling delay.
 - **Listener completeness varies.** Some listener/parser paths may miss events
   or omit metadata; PumpPortal still requires authoritative chain refresh.
-- **Logging and local SQLite writes are not benchmarked.** Identity persistence
-  is correctness-critical; broader latency work belongs to a later milestone.
+- **Durable identity writes remain synchronous.** Signature persistence is
+  correctness-critical and intentionally precedes confirmation. Diagnostic
+  telemetry and ordinary log I/O are asynchronous, but SQLite/device latency
+  still needs measurement on the deployment host.
+- **Detector latency can dominate sender latency.** PumpPortal has no
+  authoritative event slot and must refresh chain state; Geyser/log/block
+  observations depend on the chosen provider and network path.
+- **No real transaction benchmark was run.** Offline tests prove routing
+  semantics, not mainnet landing performance.
 
 ## Secret handling
 

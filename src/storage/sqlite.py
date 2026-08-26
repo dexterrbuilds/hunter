@@ -22,7 +22,7 @@ from domain.lifecycle import (
 from execution.errors import ErrorClassification
 from execution.telemetry import ExecutionTelemetry
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -112,6 +112,12 @@ class SQLitePositionStore:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (2, _now()),
+                )
+            if 3 not in applied:
+                self._migration_3(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, _now()),
                 )
 
     @staticmethod
@@ -222,6 +228,27 @@ class SQLitePositionStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(logical_execution_id, submission_attempt)
             )"""
+        )
+
+    @staticmethod
+    def _migration_3(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS provider_submission_telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                logical_execution_id TEXT NOT NULL,
+                submission_attempt INTEGER NOT NULL,
+                provider_id TEXT NOT NULL,
+                endpoint_id TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                execution_variant TEXT NOT NULL,
+                accepted INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS provider_submission_provider_idx "
+            "ON provider_submission_telemetry(provider_id, endpoint_id)"
         )
 
     @property
@@ -581,6 +608,31 @@ class SQLitePositionStore:
                 "VALUES (?, ?, ?, ?)",
                 (telemetry.execution_id, attempt, payload, _now()),
             )
+            self._connection.execute(
+                "DELETE FROM provider_submission_telemetry "
+                "WHERE logical_execution_id = ? AND submission_attempt = ?",
+                (telemetry.execution_id, attempt),
+            )
+            for provider_attempt in telemetry.provider_attempts:
+                attempt_payload = _json_safe(asdict(provider_attempt))
+                self._connection.execute(
+                    """INSERT INTO provider_submission_telemetry(
+                        logical_execution_id, submission_attempt, provider_id,
+                        endpoint_id, signature, execution_variant, accepted,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        telemetry.execution_id,
+                        attempt,
+                        provider_attempt.provider_id,
+                        provider_attempt.endpoint_id,
+                        provider_attempt.signature,
+                        provider_attempt.execution_variant,
+                        int(provider_attempt.accepted),
+                        json.dumps(attempt_payload, sort_keys=True),
+                        _now(),
+                    ),
+                )
 
     def get_telemetry(
         self, logical_execution_id: str, attempt: int
@@ -592,6 +644,22 @@ class SQLitePositionStore:
                 (logical_execution_id, attempt),
             ).fetchone()
         return json.loads(row[0]) if row is not None else None
+
+    def list_telemetry(self) -> list[dict[str, Any]]:
+        """Return every execution snapshot for offline benchmark reports."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM execution_telemetry ORDER BY created_at"
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def list_provider_submission_telemetry(self) -> list[dict[str, Any]]:
+        """Return credential-free per-provider attempts for comparisons."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM provider_submission_telemetry ORDER BY id"
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def set_setting(self, key: str, value: Any) -> None:
         with self._lock:
@@ -669,13 +737,19 @@ def _row_to_execution(row: sqlite3.Row) -> StoredExecution:
 
 
 def _telemetry_json(telemetry: ExecutionTelemetry) -> str:
-    payload = asdict(telemetry)
-    for key, value in tuple(payload.items()):
-        if isinstance(value, datetime):
-            payload[key] = value.isoformat()
-        elif isinstance(value, ErrorClassification):
-            payload[key] = value.value
-    return json.dumps(payload, sort_keys=True)
+    return json.dumps(_json_safe(asdict(telemetry)), sort_keys=True)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, ErrorClassification):
+        return value.value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _now() -> str:

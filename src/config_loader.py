@@ -201,6 +201,30 @@ def validate_config(config: dict) -> None:
     # otherwise a bad mint alias only surfaces on the first non-SOL coin.
     validate_quote_config(config)
 
+    execution = config.get("execution")
+    if execution is not None:
+        if not isinstance(execution, dict):
+            raise ValueError("execution must be a mapping")
+        from execution.providers.factory import routing_config_from_dict
+
+        routing = routing_config_from_dict(execution)
+        if routing.enabled and routing.jito_tip_lamports:
+            risk = config.get("risk", {})
+            if not risk.get("enforce", False):
+                raise ValueError("tipped execution requires risk.enforce: true")
+            if not risk.get("reject_unknown_base_fee", True):
+                raise ValueError(
+                    "tipped execution requires risk.reject_unknown_base_fee: true"
+                )
+
+    benchmark = config.get("benchmark")
+    if benchmark is not None:
+        if not isinstance(benchmark, dict):
+            raise ValueError("benchmark must be a mapping")
+        allow_live = benchmark.get("allow_live_submission", False)
+        if not isinstance(allow_live, bool):
+            raise ValueError("benchmark.allow_live_submission must be true or false")
+
     # Platform-specific validation
     platform_str = config.get("platform", "pump_fun")
     try:

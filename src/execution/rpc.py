@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from time import monotonic_ns
+
 from solders.hash import Hash
 from solders.instruction import Instruction
 from solders.keypair import Keypair
@@ -14,9 +16,13 @@ from execution.confirmation import TransactionObservation
 from execution.ports import (
     AccountSnapshot,
     BlockhashContext,
+    ExecutionContext,
     SignedTransaction,
+    SubmissionResult,
     UnsignedTransaction,
 )
+from execution.telemetry import utc_now
+from utils.redaction import endpoint_identifier
 
 
 class SolanaRpcAccountReader:
@@ -97,12 +103,43 @@ class SolanaRpcTransactionSubmitter:
     def __init__(self, client: SolanaClient):
         self.client = client
 
+    @property
+    def provider_id(self) -> str:
+        return "solana-json-rpc"
+
+    async def submit(
+        self,
+        transaction: SignedTransaction,
+        execution_context: ExecutionContext,
+    ) -> SubmissionResult:
+        started = monotonic_ns()
+        signature = await self.submit_wire(transaction)
+        acknowledged = monotonic_ns()
+        if signature != transaction.signature:
+            raise ValueError(
+                "RPC returned a signature different from signed wire bytes"
+            )
+        return SubmissionResult(
+            signature,
+            self.provider_id,
+            endpoint_identifier(self.client.rpc_endpoint),
+            execution_variant=execution_context.execution_variant,
+            bytes_sent=len(transaction.wire_bytes),
+            submit_started_mono_ns=started,
+            acknowledged_mono_ns=acknowledged,
+            response_wall_time=utc_now(),
+        )
+
     async def submit_wire(
         self, transaction: SignedTransaction, *, skip_preflight: bool = True
     ) -> str:
         return await self.client.submit_wire_transaction(
             transaction.wire_bytes, skip_preflight=skip_preflight
         )
+
+    async def close(self) -> None:
+        """The owner of SolanaClient controls its shared connection lifecycle."""
+        return None
 
 
 class SolanaRpcConfirmationService:

@@ -5,9 +5,12 @@ Universal logs listener that works with any platform through the interface syste
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from time import monotonic_ns
 
 import websockets
 
+from execution.detection import record_detection
+from execution.telemetry import utc_now
 from interfaces.core import Platform, TokenInfo
 from monitoring.base_listener import BaseTokenListener
 from utils.logger import get_logger
@@ -202,6 +205,8 @@ class UniversalLogsListener(BaseTokenListener):
         """Wait for token creation events from any platform."""
         try:
             response = await asyncio.wait_for(websocket.recv(), timeout=30)
+            observed_at = utc_now()
+            observed_mono_ns = monotonic_ns()
             data = json.loads(response)
 
             if "method" not in data or data["method"] != "logsNotification":
@@ -210,11 +215,23 @@ class UniversalLogsListener(BaseTokenListener):
             log_data = data["params"]["result"]["value"]
             logs = log_data.get("logs", [])
             signature = log_data.get("signature", "unknown")
+            slot = (
+                data.get("params", {}).get("result", {}).get("context", {}).get("slot")
+            )
 
             # Try each platform's event parser
             for platform, parser in self.platform_parsers.items():
                 token_info = parser.parse_token_creation_from_logs(logs, signature)
                 if token_info:
+                    record_detection(
+                        token_info,
+                        source="solana_logs",
+                        event_slot=slot,
+                        transaction_slot=slot,
+                        launch_slot=slot,
+                        observed_at=observed_at,
+                        observed_mono_ns=observed_mono_ns,
+                    )
                     return token_info
 
             return None

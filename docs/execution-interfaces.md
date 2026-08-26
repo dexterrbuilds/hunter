@@ -1,9 +1,8 @@
 # Execution interfaces
 
-Milestone 2 provides concrete boundaries around the existing
-`core.client.SolanaClient` without replacing it as Hunter's only active backend.
-The provider-neutral contracts and standard JSON-RPC adapters live under
-`src/execution/`; alternative delivery providers are not implemented.
+Milestone 3 uses the concrete boundaries around `core.client.SolanaClient` for
+standard RPC, Helius Sender, Jito single-transaction delivery, and multiple
+generic RPC endpoints. The original standard path remains active by default.
 
 ## Principles
 
@@ -48,9 +47,10 @@ the same contract. Logs may identify a public key but never signer secrets.
 
 ### Transaction submitter
 
-Accepts one signed transaction and submission options. It returns the provider
-response, signature, response timestamp, and any provider-observed submission
-slot. Submission does not imply confirmation or on-chain success.
+Accepts one `SignedTransaction` and immutable `ExecutionContext`. It returns a
+normalized `SubmissionResult` containing provider/endpoint identity,
+acknowledgement type, signature, byte count, monotonic RTT fields, and a typed
+failure. Submission does not imply confirmation or on-chain success.
 
 ### Confirmation service
 
@@ -82,8 +82,9 @@ account reader, blockhash provider, fee estimator, and telemetry are injected
 ports shared by the orchestration layer.
 ```
 
-The standard Solana RPC adapter remains the benchmark baseline. Alternative
-delivery methods will only be added after equivalent tests and measurements
-exist. Logical execution coordination now persists signatures and blockhash
-validity before confirmation, and ambiguous identities are inspected before a
-replacement is considered.
+The standard Solana RPC adapter remains the benchmark baseline. Provider
+routing never grants authority to create a replacement signature: it only
+relays one signed identity over compatible transports. Tipped messages are
+explicit execution variants. Logical execution coordination persists the
+signature and blockhash validity before confirmation, and ambiguous identities
+are inspected before a replacement is considered.

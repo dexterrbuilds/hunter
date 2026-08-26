@@ -94,6 +94,30 @@ class ExecutionEffectsTests(unittest.TestCase):
         self.assertEqual(result.network_fee_lamports, 5_000)
         self.assertEqual(result.rent_lamports, rent)
 
+    def test_delivery_tip_is_separate_from_rent(self):
+        quote_spent = 101_550
+        rent = 2_039_280
+        delivery_tip = 1_000
+        tx = transaction(
+            pre_lamports=10_000_000,
+            post_lamports=(10_000_000 - quote_spent - 5_000 - rent - delivery_tip),
+            post_tokens=[token_balance(1, USER, TOKEN, 2_000_000)],
+        )
+        result = parse_execution_result(
+            logical_execution_id="buy",
+            side=ExecutionSide.BUY,
+            signature="sig",
+            transaction=tx,
+            user=USER,
+            token_mint=TOKEN,
+            quote_mint=WSOL_MINT,
+            trade_event=EVENT,
+            priority_fee_lamports=1_000,
+            delivery_tip_lamports=delivery_tip,
+        )
+        self.assertEqual(result.rent_lamports, rent)
+        self.assertEqual(result.delivery_tip_lamports, delivery_tip)
+
     def test_sol_sell_parses_actual_proceeds(self):
         proceeds = 98_450
         tx = transaction(
