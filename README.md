@@ -69,7 +69,7 @@ protocol path.
 | Accounting | Actual transaction effects, raw cost basis, realized PnL, separate SOL network costs for SPL-quoted trades |
 | Risk | Trading switch, kill switch, trade/position/exposure caps, fee caps, wallet reserve, trade-rate limit |
 | Telemetry | Detection-to-land timing, provider attempts, blockhash age, fee settings, slots, confirmation progression |
-| Benchmarking | Offline replay/construction timing and provider comparison reports from Hunter's own recorded data |
+| Benchmarking | Offline replay, passive multi-detector observation, read-only transport probes, and guarded opt-in economic trials |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
@@ -408,8 +408,11 @@ authoritative launch slot as the token creation. If a source does not provide an
 authoritative launch slot—PumpPortal currently does not—Hunter reports detection
 and landing data without manufacturing a block number.
 
-Live benchmark submission is disabled by default. Automated tests never submit
-a transaction.
+Live benchmark submission is disabled by default and isolated from normal bot
+startup. Passive detection and read-only transport commands can gather regional
+evidence without buying. A tiny economic trial requires an explicit mint, raw
+amount, independent hard caps, active risk enforcement, an exact acknowledgement,
+and the `--allow-live` flag. See [Controlled live benchmark](docs/live-benchmark.md).
 
 ## What is not implemented
 
@@ -472,6 +475,7 @@ measurements from the intended deployment environment.
 | [Execution telemetry](docs/execution-telemetry.md) | Durable schema, monotonic timing, provider attempts, fee fields |
 | [Landing metrics](docs/landing-metrics.md) | Slot definitions, same-slot reporting, detection ambiguity |
 | [Benchmarking](docs/benchmarking.md) | Offline replay, reports, and explicit live opt-in rules |
+| [Controlled live benchmark](docs/live-benchmark.md) | Passive detection, transport probes, guarded tiny trades, exports, and interpretation |
 | [Known risks](docs/known-risks.md) | Unresolved funds, accounting, recovery, protocol, and throughput risks |
 | [Upstream provenance](UPSTREAM.md) | Imported source snapshot, derivative-work notice, IDL checksums |
 

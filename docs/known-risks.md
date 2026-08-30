@@ -125,8 +125,14 @@ improvements from risks that remain open; it is not exhaustive.
 - **Detector latency can dominate sender latency.** PumpPortal has no
   authoritative event slot and must refresh chain state; Geyser/log/block
   observations depend on the chosen provider and network path.
-- **No real transaction benchmark was run.** Offline tests prove routing
-  semantics, not mainnet landing performance.
+- **No real transaction benchmark has been run by the project.** Milestone 3.5
+  adds guarded preparation and passive/read-only measurement, but offline tests
+  still prove only routing and safety semantics—not mainnet landing performance.
+- **Live benchmarks remain financially risky.** Slippage, adverse selection,
+  token behavior, provider failure, and sell failure can lose the entire tiny
+  benchmark amount. Caps bound exposure; they do not make a trade safe.
+- **A dedicated-wallet declaration is operator supplied.** Hunter warns when it
+  is false but cannot prove that a configured key is separate from production.
 
 ## Secret handling
 

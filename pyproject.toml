@@ -30,6 +30,10 @@ dev = [
 [project.scripts]
 hunter = "bot_runner:main"
 hunter-benchmark-report = "benchmark.report:main"
+hunter-benchmark-live = "benchmark.cli:live_main"
+hunter-benchmark-detection = "benchmark.cli:detection_main"
+hunter-benchmark-transport = "benchmark.cli:transport_main"
+hunter-live-benchmark-report = "benchmark.cli:report_main"
 
 [tool.setuptools]
 py-modules = ["bot_runner", "config_loader"]

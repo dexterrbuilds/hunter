@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from benchmark.live_config import live_benchmark_config_from_dict
 from interfaces.core import Platform
 from utils.redaction import register_config_secrets
 
@@ -224,6 +225,8 @@ def validate_config(config: dict) -> None:
         allow_live = benchmark.get("allow_live_submission", False)
         if not isinstance(allow_live, bool):
             raise ValueError("benchmark.allow_live_submission must be true or false")
+        if "live_enabled" in benchmark:
+            live_benchmark_config_from_dict(benchmark)
 
     # Platform-specific validation
     platform_str = config.get("platform", "pump_fun")

@@ -1,44 +1,52 @@
 # Safe benchmarking
 
-Automated Hunter benchmarks are offline. `OfflineReplayBenchmark` can replay
-recorded detector inputs through pure construction/parsing callbacks, and
-`benchmark_sync` measures construction or signing callables. Read, blockhash,
-status, and simulation probes can be built on the provider interfaces, but no
-automated test submits a transaction.
+Hunter separates benchmarks into three categories. Offline replay stays entirely
+local. Transport benchmarks make read-only RPC calls. Economic benchmarks are
+isolated, explicitly authorized Pump.fun buys and optional sells guarded by the
+normal risk engine and a second set of benchmark-only limits.
 
-The safety model defaults to:
+Automated tests only use fake providers. They never submit to mainnet or devnet.
 
-```yaml
-benchmark:
-  allow_live_submission: false
-```
-
-Any future live or non-economic submission command must call the explicit
-opt-in guard. Milestone 3 provides no automatic live-send benchmark, and
-validation performs no mainnet or devnet submission.
-
-## Provider report
-
-Generate a JSON summary from Hunter's local telemetry database:
+## Commands
 
 ```bash
-hunter-benchmark-report data/hunter.sqlite3
+# Passive launch observation; no wallet and no transaction
+hunter-benchmark-detection observer.yaml --duration 300 \
+  --database data/hunter-benchmarks.sqlite3 --region-label frankfurt-vps
+
+# Read-only health/blockhash/account/status/fee-estimator RTT
+hunter-benchmark-transport provider-config.yaml --iterations 10 \
+  --database data/hunter-benchmarks.sqlite3 --region-label frankfurt-vps
+
+# Controlled economic trial; refuses without all authorization conditions
+hunter-benchmark-live bots/private-benchmark.yaml --route rpc-primary \
+  --database data/hunter-benchmarks.sqlite3 --allow-live
+
+# Credential-free human summary with optional JSON/CSV export
+hunter-live-benchmark-report data/hunter-benchmarks.sqlite3
+hunter-live-benchmark-report data/hunter-benchmarks.sqlite3 \
+  --format csv --export benchmark-summary.csv
 ```
 
-The report groups sanitized provider/endpoint identities and includes sample
-count, median/p90 submit RTT, median/p90 submit-to-land, median slots-to-land,
-same-slot/+1/+2-or-later percentages, failure rate, ambiguous outcome rate,
-and estimated average known SOL fee. A provider is only marked
-`ranking_eligible` after the configured minimum sample count (20 by default).
-The tool does not declare a winner; samples must also use comparable detection,
-transaction, fee, and confirmation policies.
+The older `hunter-benchmark-report` command continues to summarize ordinary
+execution telemetry in the position database.
 
-In a race, submit-to-land is measured from each adapter attempt's monotonic send
-time, but landing the shared signature cannot prove which transport caused
-inclusion. Slot and outcome evidence therefore describes the shared economic
-execution and must not be presented as causal provider attribution.
+## What a report means
 
-Safe live evaluation, if added later, should use a separately funded wallet,
-an explicitly non-economic transaction, strict fee caps, a known cluster, and
-manual invocation. It must never reuse a production trading wallet merely for
-benchmark convenience.
+Detection sources are correlated by creation transaction signature when a
+listener supplies one, otherwise by mint. Each source is compared with the
+earliest Hunter observation of that same creation. Provider attempts retain
+failures and are split by cold, warm, and reconnected connection state.
+
+In a race, all compatible providers receive identical signed bytes. Landing the
+shared signature cannot prove which provider caused inclusion, so per-provider
+acknowledgement RTT and shared landing evidence must not be confused with causal
+attribution. A tipped variant changes the message and is a separate economic
+trial.
+
+Provider rows are not ranking-eligible until the minimum sample count is met.
+Even then, compare like-for-like detector, route, fee, commitment, wallet, token,
+and region conditions. No provider is universally fastest.
+
+See [Controlled live benchmark](live-benchmark.md) for the authorization and
+financial-safety procedure.

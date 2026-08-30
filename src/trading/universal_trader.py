@@ -905,11 +905,16 @@ class UniversalTrader:
         except Exception:
             logger.exception(f"Error handling token {token_info.symbol}")
 
-    async def _execute_managed_buy(self, token_info: TokenInfo) -> TradeResult:
+    async def _execute_managed_buy(
+        self,
+        token_info: TokenInfo,
+        *,
+        logical_execution_id: str | None = None,
+    ) -> TradeResult:
         """Persist logical buy identity before waiting for confirmation."""
         if not hasattr(self, "position_store"):
             return await self.buyer.execute(token_info)
-        logical_execution_id = f"buy:{token_info.mint}"
+        logical_execution_id = logical_execution_id or f"buy:{token_info.mint}"
         execution = self.position_store.create_execution(
             logical_execution_id, position_id=None, side="buy"
         )
@@ -1296,7 +1301,12 @@ class UniversalTrader:
                 )  # Continue monitoring despite errors
 
     async def _execute_managed_sell(
-        self, token_info: TokenInfo, *, token_amount: float, token_price: float
+        self,
+        token_info: TokenInfo,
+        *,
+        token_amount: float,
+        token_price: float,
+        logical_execution_id: str | None = None,
     ) -> TradeResult:
         """Persist sell lifecycle and inspect ambiguous signatures before retry."""
         if not hasattr(self, "active_position_ids"):
@@ -1307,7 +1317,6 @@ class UniversalTrader:
             )
         mint_key = str(token_info.mint)
         position_id = self.active_position_ids.get(mint_key)
-        logical_execution_id = None
         pending_execution = None
         if position_id is not None:
             stored = self.position_service.get_position(position_id)
@@ -1317,7 +1326,8 @@ class UniversalTrader:
             logical_execution_id = (
                 pending_execution.logical_execution_id
                 if pending_execution is not None
-                else f"sell:{position_id}:{stored.accounting.sold_quantity_raw}"
+                else logical_execution_id
+                or f"sell:{position_id}:{stored.accounting.sold_quantity_raw}"
             )
             pending_execution = self.position_store.create_execution(
                 logical_execution_id, position_id=position_id, side="sell"

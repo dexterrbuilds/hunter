@@ -64,5 +64,5 @@ priority_fees:
   cache_ttl_seconds: 5.0
   refresh_interval_seconds: 2.0
 
-benchmark:
-  allow_live_submission: false
+# Live economic benchmark authorization is intentionally absent from this
+# provider-only example. See docs/live-benchmark.md and keep it in private YAML.
