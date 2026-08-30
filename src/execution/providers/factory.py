@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any
 from execution.errors import ErrorClassification, ExecutionError
 from execution.metrics import LatencyBudgets
 from execution.providers.adapters import (
+    HeliusSenderMaxSubmitter,
     HeliusSenderSubmitter,
     JitoTransactionSubmitter,
     JsonRpcTransactionSubmitter,
+    TritonJetSubmitter,
 )
 from execution.providers.config import (
     BroadcastMode,
@@ -84,8 +86,12 @@ def _submitter(endpoint: ProviderEndpoint) -> TransactionSubmitter:
         return JsonRpcTransactionSubmitter(endpoint)
     if endpoint.kind == ProviderKind.HELIUS_SENDER:
         return HeliusSenderSubmitter(endpoint)
+    if endpoint.kind == ProviderKind.HELIUS_SENDER_MAX:
+        return HeliusSenderMaxSubmitter(endpoint)
     if endpoint.kind == ProviderKind.JITO:
         return JitoTransactionSubmitter(endpoint)
+    if endpoint.kind in {ProviderKind.TRITON_JET, ProviderKind.SWQOS}:
+        return TritonJetSubmitter(endpoint)
     raise ExecutionError(
         ErrorClassification.UNSUPPORTED_PROVIDER,
         f"unsupported provider kind: {endpoint.kind}",
@@ -134,6 +140,8 @@ def _provider_from_dict(value: object) -> ProviderEndpoint:
             if value.get("warmup_endpoint") is not None
             else None
         ),
+        region=(_string(value, "region", "") or None),
+        required=_boolean(value, "required", default=False),
     )
 
 

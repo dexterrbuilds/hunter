@@ -43,6 +43,7 @@ from execution.detection import detection_for
 from execution.errors import ErrorClassification
 from execution.telemetry import ExecutionTelemetry
 from interfaces.core import AddressProvider, Platform, TokenInfo
+from monitoring.performance.fast_path import assess_fast_path
 from platforms import get_platform_implementations
 from trading.base import Trader, TradeResult
 from utils.logger import get_logger
@@ -378,6 +379,17 @@ class PlatformAwareBuyer(Trader):
                 # mayhem/cashback flags and quote_mint, nothing sits between
                 # detection and submission. Otherwise (pumpportal, old-format
                 # events) refresh from chain or skip.
+                fast_path = assess_fast_path(token_info)
+                if telemetry is not None:
+                    telemetry.attributes["fast_path_confidence"] = (
+                        fast_path.confidence.value
+                    )
+                    telemetry.attributes["fast_path_missing_fields"] = ",".join(
+                        fast_path.missing_fields
+                    )
+                    telemetry.attributes["fast_path_trust_create_event"] = (
+                        self.trust_create_event
+                    )
                 if not self._can_skip_refresh(token_info):
                     skip_reason = await self._refresh_curve_state(
                         token_info, address_provider, curve_manager
@@ -781,8 +793,7 @@ class PlatformAwareBuyer(Trader):
         """
         return (
             self.trust_create_event
-            and token_info.state_from_event
-            and token_info.quote_mint is not None
+            and assess_fast_path(token_info).may_skip_hot_path_reads
         )
 
     async def _refresh_curve_state(

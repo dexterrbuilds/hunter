@@ -19,6 +19,14 @@ separate.
   explicitly tipped variant, exactly one tip instruction, a positive CU price,
   and configured tip bounds. It does not call a provider SDK that rebuilds the
   trade. See [Helius Sender documentation](https://www.helius.dev/docs/sending-transactions/sender).
+- `helius_sender_max` isolates the maximum-performance Sender path. It accepts
+  only an explicit `sender_max_tipped` variant with exactly one bounded tip and
+  a positive CU price, supports provider `/ping` warm-up, records its region,
+  and uses the same normalized acknowledgement/error lifecycle.
+- `triton_jet` and generic `swqos` send an ordinary signed transaction through
+  a provider-issued Solana-compatible Cascade/Yellowstone Jet endpoint. They do
+  not invent a public Triton endpoint or proprietary request fields. See
+  [Triton Cascade](https://docs.triton.one/chains/solana/cascade).
 - `jito` implements Jito Block Engine's single-transaction
   `/api/v1/transactions` method. Normal relay, a tipped transaction, and
   `bundleOnly=true` are distinguished in telemetry. `bundleOnly` requires at
@@ -41,9 +49,15 @@ confirmation of the existing signature; it is not treated as proof of success
 or as permission to sign again.
 
 A tip changes the transaction message, so it is a separate execution variant:
-`jito_tipped` or `helius_sender_tipped`. Hunter constructs that variant once,
+`jito_tipped`, `helius_sender_tipped`, or `sender_max_tipped`. Hunter constructs that variant once,
 signs it once, and can relay that one signature across compatible transports.
 It does not mix tipped and untipped messages inside one race.
+
+Every adapter also declares normalized capabilities: accepted variants,
+standard signed-message support, same-signature race support, tip and CU-price
+requirements, and transport features such as SWQoS, Sender Max, Jito, or direct
+leader routing. A race/hedge containing known incompatible capabilities is
+rejected before any provider call.
 
 ## Broadcast modes
 

@@ -38,6 +38,14 @@ from execution.providers.factory import routing_config_from_dict
 from execution.telemetry_sink import AsyncTelemetrySink
 from interfaces.core import Platform, TokenInfo
 from monitoring.listener_factory import ListenerFactory
+from monitoring.performance.config import (
+    InfrastructureProfile,
+    infrastructure_config_from_dict,
+)
+from monitoring.performance.readiness import (
+    ComponentState,
+    ReadinessSupervisor,
+)
 from monitoring.position_monitor import MonitorRetry, PositionMonitorManager
 from platforms import get_platform_implementations
 from storage.sqlite import SQLitePositionStore
@@ -169,10 +177,14 @@ class UniversalTrader:
         max_concurrent_positions: int = 4,
         risk_limits: RiskLimits | None = None,
         execution_config: dict | None = None,
+        infrastructure_config: dict | None = None,
     ):
         """Initialize the universal trader."""
         # Core components
         routing_config = routing_config_from_dict(execution_config)
+        infrastructure = infrastructure_config_from_dict(infrastructure_config)
+        self.infrastructure = infrastructure
+        self.readiness = None
         if (
             routing_config.enabled
             and routing_config.jito_tip_lamports
@@ -198,10 +210,20 @@ class UniversalTrader:
             if routing_config.enabled
             else 60_000
         )
+        if infrastructure.profile == InfrastructureProfile.MAXIMUM_PERFORMANCE:
+            maximum_blockhash_age_ms = min(
+                maximum_blockhash_age_ms,
+                infrastructure.maximum_blockhash_age_ms,
+            )
         self.solana_client = SolanaClient(
             rpc_endpoint,
             max_rps=max_rps,
             maximum_blockhash_age_ms=maximum_blockhash_age_ms,
+            blockhash_refresh_interval_seconds=(
+                0.75
+                if infrastructure.profile == InfrastructureProfile.MAXIMUM_PERFORMANCE
+                else 5.0
+            ),
         )
         if routing_config.enabled:
             self.solana_client.configure_execution_routing(
@@ -223,7 +245,10 @@ class UniversalTrader:
             refresh_interval_seconds=priority_fee_refresh_interval_seconds,
         )
         self.position_store = SQLitePositionStore(database_path)
-        self.telemetry_sink = AsyncTelemetrySink(self.position_store)
+        self.telemetry_sink = AsyncTelemetrySink(
+            self.position_store,
+            maximum_queue_size=infrastructure.telemetry_queue_size,
+        )
         self.position_service = PositionService(self.position_store)
         self.risk_service = RiskService(risk_limits)
         self.max_concurrent_positions = max(1, max_concurrent_positions)
@@ -301,6 +326,7 @@ class UniversalTrader:
             geyser_auth_type=geyser_auth_type,
             pumpportal_url=pumpportal_url,
             platforms=[self.platform],  # Only listen for our platform
+            infrastructure_config=infrastructure_config,
         )
 
         # Trading parameters
@@ -430,6 +456,9 @@ class UniversalTrader:
                 provider_warmup,
             )
 
+        if self.infrastructure.profile == InfrastructureProfile.MAXIMUM_PERFORMANCE:
+            await self._verify_maximum_performance_readiness(provider_warmup)
+
         await self.position_monitor_manager.start()
         await self._recover_positions()
 
@@ -479,6 +508,52 @@ class UniversalTrader:
         finally:
             await self._cleanup_resources()
             logger.info("Universal Trader has shut down")
+
+    async def _verify_maximum_performance_readiness(
+        self, provider_warmup: dict[str, bool]
+    ) -> None:
+        """Fail closed before detection if required fast-path dependencies are absent."""
+        readiness = ReadinessSupervisor(
+            allow_degraded=self.infrastructure.allow_degraded
+        )
+        readiness.register("signer", required=True)
+        readiness.update("signer", ComponentState.READY)
+        readiness.register("blockhash_cache", required=True)
+        try:
+            blockhash = await self.solana_client.get_cached_blockhash_context()
+        except RuntimeError:
+            blockhash = await self.solana_client.get_latest_blockhash_context()
+        blockhash_ready = blockhash.is_acceptable_age(
+            self.infrastructure.maximum_blockhash_age_ms
+        )
+        readiness.update(
+            "blockhash_cache",
+            ComponentState.READY if blockhash_ready else ComponentState.DEGRADED,
+            None if blockhash_ready else "cached blockhash exceeds age budget",
+        )
+        for feed in self.infrastructure.feeds:
+            if not feed.enabled:
+                continue
+            name = f"feed:{feed.feed_id}"
+            readiness.register(name, required=feed.required)
+            readiness.update(name, ComponentState.READY)
+        for endpoint in self.solana_client.execution_routing_config.for_role(
+            ProviderRole.SUBMIT
+        ):
+            name = f"sender:{endpoint.provider_id}"
+            readiness.register(name, required=endpoint.required)
+            warmed = provider_warmup.get(endpoint.provider_id, False)
+            readiness.update(
+                name,
+                ComponentState.WARM if warmed else ComponentState.DEGRADED,
+                None if warmed else "connection warm-up failed",
+            )
+        self.readiness = readiness
+        logger.info("Maximum-performance readiness: %s", readiness.report())
+        if not readiness.may_trade:
+            raise RuntimeError(  # noqa: TRY003
+                f"Hunter is not ready for maximum-performance trading: {readiness.report()}"
+            )
 
     async def _wait_for_token(self) -> TokenInfo | None:
         """Wait for a single token to be detected."""

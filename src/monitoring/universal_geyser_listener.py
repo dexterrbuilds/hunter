@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from time import monotonic_ns
 
 import grpc
+from solders.signature import Signature
 
 from execution.detection import record_detection
 from execution.telemetry import utc_now
@@ -18,22 +19,29 @@ from utils.logger import get_logger
 from utils.redaction import endpoint_identifier
 
 logger = get_logger(__name__)
+SIGNATURE_LENGTH_BYTES = 64
 
 
 class UniversalGeyserListener(BaseTokenListener):
     """Universal Geyser listener that works with any platform."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         geyser_endpoint: str,
         geyser_api_token: str,
         geyser_auth_type: str,
         platforms: list[Platform] | None = None,
-    ):
+        commitment: str = "processed",
+        source_name: str = "yellowstone_geyser",
+        source_region: str | None = None,
+    ) -> None:
         """Initialize universal Geyser listener."""
         super().__init__()
         self.geyser_endpoint = geyser_endpoint
         self.geyser_api_token = geyser_api_token
+        self.commitment = commitment
+        self.source_name = source_name
+        self.source_region = source_region
 
         valid_auth_types = {"x-token", "basic"}
         self.auth_type: str = (geyser_auth_type or "x-token").lower()
@@ -114,7 +122,16 @@ class UniversalGeyserListener(BaseTokenListener):
             request.transactions[filter_name].account_include.append(str(program_id))
             request.transactions[filter_name].failed = False
 
-        request.commitment = geyser_pb2.CommitmentLevel.PROCESSED
+        commitment = {
+            "processed": geyser_pb2.CommitmentLevel.PROCESSED,
+            "confirmed": geyser_pb2.CommitmentLevel.CONFIRMED,
+            "finalized": geyser_pb2.CommitmentLevel.FINALIZED,
+        }
+        if self.commitment not in commitment:
+            raise ValueError(  # noqa: TRY003
+                "Geyser commitment must be processed, confirmed, or finalized"
+            )
+        request.commitment = commitment[self.commitment]
         return request
 
     async def listen_for_tokens(
@@ -151,6 +168,7 @@ class UniversalGeyserListener(BaseTokenListener):
                         token_info = await self._process_update(update)
                         if not token_info:
                             continue
+                        parser_completed_mono_ns = monotonic_ns()
                         slot = (
                             int(update.transaction.slot)
                             if update.HasField("transaction")
@@ -158,12 +176,16 @@ class UniversalGeyserListener(BaseTokenListener):
                         )
                         record_detection(
                             token_info,
-                            source="yellowstone_geyser",
+                            source=self.source_name,
                             event_slot=slot,
                             transaction_slot=slot,
                             launch_slot=slot,
                             observed_at=observed_at,
                             observed_mono_ns=observed_mono_ns,
+                            source_region=self.source_region,
+                            transaction_signature=self._transaction_signature(update),
+                            parser_completed_mono_ns=parser_completed_mono_ns,
+                            validation_completed_mono_ns=parser_completed_mono_ns,
                         )
 
                         logger.info(
@@ -227,3 +249,12 @@ class UniversalGeyserListener(BaseTokenListener):
         except Exception:
             logger.exception("Error processing Geyser update")
             return None
+
+    @staticmethod
+    def _transaction_signature(update: geyser_pb2.SubscribeUpdate) -> str | None:
+        if not update.HasField("transaction"):
+            return None
+        raw = bytes(update.transaction.transaction.signature)
+        if len(raw) != SIGNATURE_LENGTH_BYTES:
+            return None
+        return str(Signature.from_bytes(raw))

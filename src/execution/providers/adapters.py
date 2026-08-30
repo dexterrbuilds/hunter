@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from time import monotonic_ns
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from execution.errors import ErrorClassification
@@ -21,6 +21,9 @@ from execution.providers.config import ProviderEndpoint, ProviderKind
 from execution.providers.transport import AioHttpJsonRpcTransport, JsonRpcTransport
 from execution.telemetry import utc_now
 from utils.redaction import sanitize_text
+
+if TYPE_CHECKING:
+    from execution.providers.capabilities import ProviderCapabilities
 
 HTTP_UNAUTHORIZED = {401, 403}
 HTTP_RATE_LIMIT = 429
@@ -47,6 +50,11 @@ class JsonRpcTransactionSubmitter:
     @property
     def provider_id(self) -> str:
         return self.endpoint.provider_id
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        """Expose normalized routing constraints for this adapter."""
+        return self.endpoint.capabilities
 
     def _request(self, transaction: SignedTransaction) -> dict[str, Any]:
         return {
@@ -120,6 +128,7 @@ class JsonRpcTransactionSubmitter:
                     signature=transaction.signature,
                     provider_id=self.provider_id,
                     endpoint_id=self.endpoint.endpoint_id,
+                    provider_region=self.endpoint.region,
                     execution_variant=execution_context.execution_variant,
                     accepted=True,
                     acknowledgement="duplicate_signature",
@@ -139,6 +148,7 @@ class JsonRpcTransactionSubmitter:
                 signature=transaction.signature,
                 provider_id=self.provider_id,
                 endpoint_id=self.endpoint.endpoint_id,
+                provider_region=self.endpoint.region,
                 execution_variant=execution_context.execution_variant,
                 accepted=False,
                 acknowledgement="error",
@@ -178,6 +188,7 @@ class JsonRpcTransactionSubmitter:
             signature=signature,
             provider_id=self.provider_id,
             endpoint_id=self.endpoint.endpoint_id,
+            provider_region=self.endpoint.region,
             execution_variant=execution_context.execution_variant,
             accepted=True,
             acknowledgement=acknowledgement,
@@ -206,6 +217,7 @@ class JsonRpcTransactionSubmitter:
             signature=transaction.signature,
             provider_id=self.provider_id,
             endpoint_id=self.endpoint.endpoint_id,
+            provider_region=self.endpoint.region,
             execution_variant=execution_context.execution_variant,
             accepted=False,
             acknowledgement="error",
@@ -291,6 +303,70 @@ class HeliusSenderSubmitter(JsonRpcTransactionSubmitter):
             request,
             acknowledgement="helius_sender_signature",
         )
+
+
+class HeliusSenderMaxSubmitter(JsonRpcTransactionSubmitter):
+    """Helius Sender Max adapter for one explicitly tipped message variant."""
+
+    def __init__(
+        self,
+        endpoint: ProviderEndpoint,
+        transport: JsonRpcTransport | None = None,
+    ) -> None:
+        if endpoint.kind != ProviderKind.HELIUS_SENDER_MAX:
+            raise ValueError(
+                "Helius Sender Max submitter requires a helius_sender_max endpoint"
+            )
+        self.endpoint = endpoint
+        self.transport = transport or AioHttpJsonRpcTransport()
+        self._owns_transport = transport is None
+
+    async def submit(
+        self,
+        transaction: SignedTransaction,
+        execution_context: ExecutionContext,
+    ) -> SubmissionResult:
+        invalid = _validate_tipped_variant(
+            transaction,
+            execution_context,
+            endpoint=self.endpoint,
+            require_priority_fee=True,
+            allowed_variants={"sender_max_tipped"},
+        )
+        if invalid is not None:
+            return invalid
+        request = {
+            "jsonrpc": "2.0",
+            "id": transaction.signature,
+            "method": "sendTransaction",
+            "params": [
+                base64.b64encode(transaction.wire_bytes).decode("ascii"),
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 0},
+            ],
+        }
+        return await self._submit_request(
+            transaction,
+            execution_context,
+            request,
+            acknowledgement="helius_sender_max_signature",
+        )
+
+
+class TritonJetSubmitter(JsonRpcTransactionSubmitter):
+    """Solana-compatible Triton Cascade/Yellowstone Jet SWQoS sender."""
+
+    def __init__(
+        self,
+        endpoint: ProviderEndpoint,
+        transport: JsonRpcTransport | None = None,
+    ) -> None:
+        if endpoint.kind not in {ProviderKind.TRITON_JET, ProviderKind.SWQOS}:
+            raise ValueError(
+                "Triton Jet submitter requires a triton_jet/swqos endpoint"
+            )
+        self.endpoint = endpoint
+        self.transport = transport or AioHttpJsonRpcTransport()
+        self._owns_transport = transport is None
 
 
 class JitoTransactionSubmitter(JsonRpcTransactionSubmitter):
@@ -476,6 +552,7 @@ def _validation_failure(
         signature=transaction.signature,
         provider_id=endpoint.provider_id,
         endpoint_id=endpoint.endpoint_id,
+        provider_region=endpoint.region,
         execution_variant=context.execution_variant,
         accepted=False,
         acknowledgement="validation_error",

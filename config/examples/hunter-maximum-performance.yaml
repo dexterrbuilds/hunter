@@ -1,0 +1,156 @@
+# Hunter maximum-performance reference. It is intentionally disabled and
+# fail-closed. Copy to a private YAML file; never place real credentials here.
+name: hunter-maximum-performance
+env_file: .env
+enabled: false
+separate_process: true
+platform: pump_fun
+
+rpc_endpoint: ${SOLANA_NODE_RPC_ENDPOINT}
+wss_endpoint: ${SOLANA_NODE_WSS_ENDPOINT}
+private_key: ${SOLANA_PRIVATE_KEY}
+
+infrastructure:
+  profile: maximum_performance
+  region: amsterdam
+  allow_degraded: false
+  maximum_blockhash_age_ms: 3000
+  claim_ttl_seconds: 600
+  observation_queue_size: 4096
+  telemetry_queue_size: 8192
+  feeds:
+    - id: rabbitstream-ams
+      kind: rabbitstream
+      endpoint: ${RABBITSTREAM_ENDPOINT}
+      token: ${RABBITSTREAM_API_KEY}
+      auth_type: x-token
+      region: amsterdam
+      commitment: processed
+      required: true
+      enabled: true
+      queue_size: 2048
+    - id: triton-riptide-ams
+      kind: riptide
+      endpoint: ${TRITON_RIPTIDE_ENDPOINT}
+      token: ${TRITON_API_KEY}
+      auth_type: x-token
+      region: amsterdam
+      commitment: processed
+      required: false
+      enabled: true
+      queue_size: 2048
+    # Raw shred reconstruction requires the provider SDK or the documented
+    # Hunter sidecar envelope. Enable only after wiring its recognizer explicitly.
+    - id: triton-shreds-ams
+      kind: triton_shreds
+      endpoint: udp://127.0.0.1:19000
+      token: ${TRITON_API_KEY}
+      region: amsterdam
+      required: false
+      enabled: false
+      queue_size: 8192
+
+execution:
+  enabled: true
+  mode: race
+  hedge_delay_ms: 25
+  maximum_blockhash_age_ms: 3000
+  maximum_combined_fee_lamports: 1000000
+  # One Sender Max-tipped message may be relayed through Sender Max and a
+  # same-signature SWQoS endpoint. Direct Jito is a separate configured variant.
+  execution_variant: sender_max_tipped
+  jito_tip_lamports: 1000
+  jito_tip_account: REPLACE_WITH_CURRENT_PROVIDER_TIP_ACCOUNT
+  providers:
+    - id: helius-sender-max-ams
+      kind: helius_sender_max
+      endpoint: ${HELIUS_SENDER_MAX_ENDPOINT}
+      warmup_endpoint: https://sender.helius-rpc.com/ping
+      region: amsterdam
+      roles: [submit]
+      priority: 10
+      required: true
+      enabled: true
+      minimum_tip_lamports: 1000
+      maximum_tip_lamports: 250000
+    - id: triton-jet-ams
+      kind: triton_jet
+      endpoint: ${TRITON_JET_ENDPOINT}
+      region: amsterdam
+      roles: [submit]
+      priority: 20
+      required: false
+      enabled: true
+    - id: rpc-fallback
+      kind: standard_rpc
+      endpoint: ${SOLANA_NODE_RPC_ENDPOINT}
+      region: amsterdam
+      roles: [account_read, blockhash, confirm, submit]
+      priority: 30
+      required: false
+      enabled: true
+      skip_preflight: true
+      max_retries: 0
+
+trade:
+  buy_amount: 0.0001
+  buy_slippage: 0.30
+  sell_slippage: 0.30
+  exit_strategy: manual
+  extreme_fast_mode: true
+  extreme_fast_token_amount: 20
+  curve_refresh_budget: 2.0
+  trust_create_event: true
+
+priority_fees:
+  enable_dynamic: true
+  enable_fixed: false
+  strategy: periodic_dynamic
+  fixed_amount: 200000
+  extra_percentage: 0.0
+  hard_cap: 1000000
+  cache_ttl_seconds: 5.0
+  refresh_interval_seconds: 2.0
+
+filters:
+  listener_type: aggregate
+  match_string: null
+  bro_address: null
+  max_token_age: 0.05
+  marry_mode: false
+  yolo_mode: false
+  allowed_quote_mints: [sol]
+
+retries:
+  max_attempts: 1
+  wait_after_creation: 0
+  wait_after_buy: 5
+  wait_before_new_token: 0
+
+cleanup:
+  mode: disabled
+  force_close_with_burn: false
+  with_priority_fee: false
+
+node:
+  max_rps: 100
+
+risk:
+  enforce: true
+  trading_enabled: false
+  emergency_kill_switch: true
+  maximum_buy_raw_by_quote: {sol: 100000}
+  maximum_position_raw_by_quote: {sol: 100000}
+  maximum_aggregate_exposure_raw_by_quote: {sol: 100000}
+  maximum_total_transaction_fee_lamports: 1000000
+  maximum_priority_fee_lamports: 250000
+  minimum_wallet_reserve_lamports: 100000000
+  maximum_trades_per_interval: 1
+  trade_interval_seconds: 60
+  reject_unknown_base_fee: true
+
+storage:
+  database_path: data/hunter.sqlite3
+
+runtime:
+  max_concurrent_positions: 4

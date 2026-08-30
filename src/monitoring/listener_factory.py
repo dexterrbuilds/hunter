@@ -13,7 +13,7 @@ class ListenerFactory:
     """Factory for creating appropriate token listeners based on configuration."""
 
     @staticmethod
-    def create_listener(
+    def create_listener(  # noqa: C901, PLR0913, PLR0917
         listener_type: str,
         wss_endpoint: str | None = None,
         geyser_endpoint: str | None = None,
@@ -21,6 +21,7 @@ class ListenerFactory:
         geyser_auth_type: str = "x-token",
         pumpportal_url: str = "wss://pumpportal.fun/api/data",
         platforms: list[Platform] | None = None,
+        infrastructure_config: dict | None = None,
     ) -> BaseTokenListener:
         """Create a token listener based on the specified type.
 
@@ -40,6 +41,11 @@ class ListenerFactory:
             ValueError: If listener type is invalid or required parameters are missing
         """
         listener_type = listener_type.lower()
+
+        if listener_type == "aggregate":
+            return ListenerFactory._create_aggregate_listener(
+                infrastructure_config, platforms
+            )
 
         if listener_type == "geyser":
             if not geyser_endpoint or not geyser_api_token:
@@ -124,8 +130,88 @@ class ListenerFactory:
         else:
             raise ValueError(
                 f"Invalid listener type '{listener_type}'. "
-                f"Must be one of: 'logs', 'blocks', 'geyser', 'pumpportal'"
+                "Must be one of: 'logs', 'blocks', 'geyser', 'pumpportal', "
+                "or 'aggregate'"
             )
+
+    @staticmethod
+    def _create_aggregate_listener(
+        value: dict | None, platforms: list[Platform] | None
+    ) -> BaseTokenListener:
+        from monitoring.performance.config import (
+            FeedKind,
+            infrastructure_config_from_dict,
+        )
+        from monitoring.performance.geyser_feeds import (
+            RabbitStreamListener,
+            TritonRiptideListener,
+        )
+        from monitoring.performance.multi_feed import MultiFeedListener
+        from monitoring.universal_geyser_listener import UniversalGeyserListener
+
+        config = infrastructure_config_from_dict(value)
+        listeners: list[BaseTokenListener] = []
+        for feed in config.feeds:
+            if not feed.enabled:
+                continue
+            if feed.kind == FeedKind.RABBITSTREAM:
+                listeners.append(
+                    RabbitStreamListener(
+                        feed.endpoint,
+                        feed.token or "",
+                        region=feed.region or config.region,
+                        auth_type=feed.auth_type,
+                        platforms=platforms,
+                        commitment=feed.commitment,
+                    )
+                )
+            elif feed.kind == FeedKind.RIPTIDE:
+                listeners.append(
+                    TritonRiptideListener(
+                        feed.endpoint,
+                        feed.token or "",
+                        region=feed.region or config.region,
+                        auth_type=feed.auth_type,
+                        platforms=platforms,
+                        commitment=feed.commitment,
+                    )
+                )
+            elif feed.kind == FeedKind.YELLOWSTONE:
+                listeners.append(
+                    UniversalGeyserListener(
+                        feed.endpoint,
+                        feed.token or "",
+                        feed.auth_type,
+                        platforms,
+                        commitment=feed.commitment,
+                        source_name=feed.feed_id,
+                        source_region=feed.region or config.region,
+                    )
+                )
+            elif feed.kind == FeedKind.PUMPPORTAL:
+                from monitoring.universal_pumpportal_listener import (
+                    UniversalPumpPortalListener,
+                )
+
+                listeners.append(UniversalPumpPortalListener(feed.endpoint, platforms))
+            elif feed.kind == FeedKind.LOGS:
+                from monitoring.universal_logs_listener import UniversalLogsListener
+
+                listeners.append(UniversalLogsListener(feed.endpoint, platforms))
+            elif feed.kind == FeedKind.BLOCKS:
+                from monitoring.universal_block_listener import UniversalBlockListener
+
+                listeners.append(UniversalBlockListener(feed.endpoint, platforms))
+            elif feed.kind == FeedKind.TRITON_SHREDS:
+                raise ValueError(  # noqa: TRY003
+                    "triton_shreds requires a provider SDK/reconstruction sidecar "
+                    "recognizer; construct TritonShredListener explicitly"
+                )
+        return MultiFeedListener(
+            listeners,
+            queue_size=config.observation_queue_size,
+            claim_ttl_seconds=config.claim_ttl_seconds,
+        )
 
     @staticmethod
     def get_supported_listener_types() -> list[str]:
@@ -134,7 +220,7 @@ class ListenerFactory:
         Returns:
             List of supported listener type strings
         """
-        return ["logs", "blocks", "geyser", "pumpportal"]
+        return ["logs", "blocks", "geyser", "pumpportal", "aggregate"]
 
     @staticmethod
     def get_platform_compatible_listeners(platform: Platform) -> list[str]:
@@ -147,9 +233,9 @@ class ListenerFactory:
             List of compatible listener types
         """
         if platform == Platform.PUMP_FUN:
-            return ["logs", "blocks", "geyser", "pumpportal"]
+            return ["logs", "blocks", "geyser", "pumpportal", "aggregate"]
         elif platform == Platform.LETS_BONK:
-            return ["blocks", "geyser", "pumpportal"]  # Added pumpportal support
+            return ["blocks", "geyser", "pumpportal", "aggregate"]
         else:
             return ["blocks", "geyser"]  # Default universal listeners
 

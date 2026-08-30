@@ -107,6 +107,7 @@ class SolanaClient:
         max_rps: float = 25.0,
         *,
         maximum_blockhash_age_ms: int = 60_000,
+        blockhash_refresh_interval_seconds: float = 5.0,
     ):
         """Initialize Solana client with RPC endpoint.
 
@@ -122,8 +123,11 @@ class SolanaClient:
         self._cached_blockhash: Hash | None = None
         self._cached_blockhash_context: BlockhashContext | None = None
         self._blockhash_lock = asyncio.Lock()
+        if blockhash_refresh_interval_seconds <= 0:
+            raise ValueError("blockhash refresh interval must be positive")
+        self.blockhash_refresh_interval_seconds = blockhash_refresh_interval_seconds
         self._blockhash_updater_task = asyncio.create_task(
-            self.start_blockhash_updater()
+            self.start_blockhash_updater(blockhash_refresh_interval_seconds)
         )
         self._rate_limiter = TokenBucketRateLimiter(max_rps=max_rps)
         self._session: aiohttp.ClientSession | None = None
@@ -155,6 +159,7 @@ class SolanaClient:
         if jito_tip_lamports and execution_variant not in {
             "jito_tipped",
             "helius_sender_tipped",
+            "sender_max_tipped",
         }:
             raise ValueError("a Jito tip requires an explicitly tipped variant")
         if jito_tip_lamports and jito_tip_account is None:

@@ -7,11 +7,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from execution.errors import ErrorClassification, ExecutionError
 from execution.metrics import LatencyBudgets
+from execution.providers.capabilities import (
+    HELIUS_SENDER_CAPABILITIES,
+    HELIUS_SENDER_MAX_CAPABILITIES,
+    JITO_CAPABILITIES,
+    STANDARD_CAPABILITIES,
+    SWQOS_CAPABILITIES,
+)
 from utils.redaction import endpoint_identifier, register_config_secrets
+
+if TYPE_CHECKING:
+    from execution.providers.capabilities import ProviderCapabilities
 
 
 class ProviderKind(StrEnum):
@@ -19,7 +30,10 @@ class ProviderKind(StrEnum):
 
     STANDARD_RPC = "standard_rpc"
     HELIUS_SENDER = "helius_sender"
+    HELIUS_SENDER_MAX = "helius_sender_max"
     JITO = "jito"
+    TRITON_JET = "triton_jet"
+    SWQOS = "swqos"
 
 
 class ProviderRole(StrEnum):
@@ -61,6 +75,8 @@ class ProviderEndpoint:
     minimum_tip_lamports: int = 0
     maximum_tip_lamports: int = 0
     warmup_endpoint: str | None = field(default=None, repr=False)
+    region: str | None = None
+    required: bool = False
 
     def __post_init__(self) -> None:
         if not self.provider_id or any(char.isspace() for char in self.provider_id):
@@ -84,7 +100,7 @@ class ProviderEndpoint:
         non_submit_roles = self.roles - {ProviderRole.SUBMIT}
         if non_submit_roles and self.kind != ProviderKind.STANDARD_RPC:
             raise ValueError(
-                "Helius Sender and Jito endpoints can only have the submit role"
+                "specialized sender endpoints can only have the submit role"
             )
         scheme = urlsplit(self.endpoint).scheme
         if ProviderRole.WEBSOCKET in self.roles and scheme not in {"ws", "wss"}:
@@ -107,6 +123,18 @@ class ProviderEndpoint:
     def supports(self, role: ProviderRole) -> bool:
         """Whether this endpoint is enabled for a routing role."""
         return self.enabled and role in self.roles
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        """Return adapter requirements without exposing vendor details upstream."""
+        return {
+            ProviderKind.STANDARD_RPC: STANDARD_CAPABILITIES,
+            ProviderKind.HELIUS_SENDER: HELIUS_SENDER_CAPABILITIES,
+            ProviderKind.HELIUS_SENDER_MAX: HELIUS_SENDER_MAX_CAPABILITIES,
+            ProviderKind.JITO: JITO_CAPABILITIES,
+            ProviderKind.TRITON_JET: SWQOS_CAPABILITIES,
+            ProviderKind.SWQOS: SWQOS_CAPABILITIES,
+        }[self.kind]
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +166,7 @@ class ExecutionRoutingConfig:
             "standard",
             "jito_tipped",
             "helius_sender_tipped",
+            "sender_max_tipped",
         }:
             raise ValueError("unsupported execution variant")
         if self.jito_tip_lamports < 0:
@@ -159,7 +188,10 @@ class ExecutionRoutingConfig:
                     "a tipped variant requires maximum_combined_fee_lamports"
                 )
             for provider in self.for_role(ProviderRole.SUBMIT):
-                if provider.kind == ProviderKind.STANDARD_RPC:
+                if (
+                    not provider.capabilities.requires_tip
+                    and provider.kind != ProviderKind.JITO
+                ):
                     continue
                 if provider.minimum_tip_lamports <= 0:
                     raise ValueError(

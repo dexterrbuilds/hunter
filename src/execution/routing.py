@@ -58,6 +58,7 @@ class SubmissionRouter:
         if transaction.signature != execution_context.signature:
             raise ValueError("execution context signature differs from wire identity")
         ordered = self._ordered_submitters()
+        self._validate_variant(ordered, execution_context.execution_variant)
         if self.mode == BroadcastMode.SINGLE:
             return await self._submit_one(ordered[0], transaction, execution_context)
         if self.mode == BroadcastMode.FALLBACK:
@@ -67,6 +68,28 @@ class SubmissionRouter:
         if self.mode == BroadcastMode.HEDGED:
             return await self._hedged(transaction, execution_context, ordered)
         raise ValueError(f"unsupported broadcast mode: {self.mode}")
+
+    def _validate_variant(
+        self,
+        submitters: Sequence[TransactionSubmitter],
+        variant: str,
+    ) -> None:
+        candidates = submitters[:1] if self.mode == BroadcastMode.SINGLE else submitters
+        capabilities = [getattr(item, "capabilities", None) for item in candidates]
+        known = [item for item in capabilities if item is not None]
+        if any(not item.accepts_variant(variant) for item in known):
+            raise ValueError(
+                f"configured provider does not accept execution variant {variant}"
+            )
+        if self.mode not in {BroadcastMode.RACE, BroadcastMode.HEDGED}:
+            return
+        if len(known) != len(candidates):
+            return
+        first = known[0]
+        if any(
+            not first.race_compatible_with(item, variant=variant) for item in known[1:]
+        ):
+            raise ValueError("broadcast race contains incompatible execution variants")
 
     async def _submit_one(
         self,

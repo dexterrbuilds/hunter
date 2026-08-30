@@ -245,6 +245,7 @@ async def start_bot(config_path: str):
             ),
             risk_limits=_risk_limits_from_config(cfg),
             execution_config=cfg.get("execution"),
+            infrastructure_config=cfg.get("infrastructure"),
         )
 
         await trader.start()

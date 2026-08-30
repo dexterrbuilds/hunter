@@ -147,6 +147,7 @@ class SubmissionResult:
     error_classification: ErrorClassification | None = None
     error_code: str | int | None = None
     diagnostic: str | None = None
+    provider_region: str | None = None
 
     @property
     def submit_rtt_ms(self) -> float | None:

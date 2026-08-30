@@ -3,6 +3,61 @@
 Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
 
+## Resolved or materially improved in Milestone 3.6
+
+- Multiple creation feeds now converge on one bounded earliest-event aggregator;
+  the first valid observation claims the mint and later/replayed observations
+  remain telemetry-only.
+- RabbitStream and Triton Riptide are isolated adapters over the generic
+  Yellowstone parser, with region, ingress, signature, slot, parse, and
+  validation timing.
+- Raw shred ingestion has bounded UDP queues/workers and a strict provider
+  SDK/sidecar reconstruction boundary; unknown packets are never guessed.
+- Pump.fun zero-read eligibility is an explicit fail-closed confidence model and
+  records missing state rather than silently assuming it.
+- Maximum-performance startup uses a strict blockhash age, faster background
+  refresh, sender warm-up, and explicit required/optional readiness states.
+- Helius Sender Max and Triton Jet/SWQoS have isolated adapters and declared
+  execution capabilities. The router rejects incompatible message variants
+  before dispatch.
+- One economic variant is signed/serialized once and reused across compatible
+  transports. New tests cover simultaneous detector arrival and incompatible
+  sender races.
+- Detection, shred, claim, and telemetry queues are bounded and expose drop
+  counts instead of growing indefinitely.
+
+## Remaining maximum-performance risks
+
+- **Native Triton raw-shred reconstruction needs the provider SDK or a reviewed
+  colocated sidecar.** Hunter supplies the bounded ingress and strict sidecar
+  envelope, not an invented Solana shred decoder. The safe example leaves it
+  disabled.
+- **The vendored Yellowstone protobuf predates Triton's beta
+  `SubscribeDeshred`.** Riptide uses ordinary processed transaction updates
+  until the canonical protobuf is deliberately refreshed and characterized.
+- **Feed connection readiness is currently local to each reconnecting adapter.**
+  Startup validates feed configuration and sender/blockhash readiness, but a
+  durable runtime readiness dashboard has not been added.
+- **Claiming is single-node.** It is concurrency-safe within one Hunter process;
+  running multiple trading replicas against the same wallet needs an external
+  coordination design before it can be safe.
+- **TTL expiry is not replacement authority.** The feed claim cache is bounded,
+  while durable execution/idempotency state remains the authority. Operators
+  must retain the SQLite database across restarts.
+- **Queue overflow drops the newest observation.** Drops are counted, but severe
+  sustained overload can hide a launch or a later correlation sample. Tune from
+  real traffic rather than removing bounds.
+- **Maximum-performance has not been live benchmarked by this project.** No
+  provider is known to be fastest from the operator's host until measured.
+- **Regional endpoint semantics and tip accounts can change.** Provider-issued
+  configuration must be rechecked; Hunter does not scrape hot-path metadata.
+- **Processed observations are not finalized truth.** A low-latency fork can be
+  abandoned. The profile exposes this risk rather than strengthening commitment
+  silently.
+- **Economically critical SQLite identity writes remain synchronous.** Removing
+  that boundary would weaken duplicate-trade safety; storage latency should be
+  measured on the production disk.
+
 ## Resolved or materially improved in Milestone 3
 
 - Standard RPC, Helius Sender, Jito single-transaction delivery, and multiple

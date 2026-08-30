@@ -6,7 +6,7 @@ execution:
   hedge_delay_ms: 75
   maximum_blockhash_age_ms: 30000
   maximum_combined_fee_lamports: 1000000
-  execution_variant: standard # standard | jito_tipped | helius_sender_tipped
+  execution_variant: standard # standard | jito_tipped | helius_sender_tipped | sender_max_tipped
   jito_tip_lamports: 0
   jito_tip_account: null
   # Warning-only budgets. They never reject a trade.
@@ -47,6 +47,25 @@ execution:
       enabled: false
       minimum_tip_lamports: 200000
       maximum_tip_lamports: 500000
+    - id: helius-sender-max-ams
+      kind: helius_sender_max
+      endpoint: "https://YOUR_PROVIDER_ISSUED_SENDER_MAX_ENDPOINT"
+      warmup_endpoint: "https://sender.helius-rpc.com/ping"
+      region: amsterdam
+      priority: 15
+      roles: [submit]
+      enabled: false
+      required: false
+      minimum_tip_lamports: 1000
+      maximum_tip_lamports: 500000
+    - id: triton-jet
+      kind: triton_jet
+      endpoint: "https://YOUR_PROVIDER_ISSUED_CASCADE_ENDPOINT/YOUR_TOKEN"
+      region: amsterdam
+      priority: 16
+      roles: [submit]
+      enabled: false
+      required: false
     - id: jito-mainnet
       kind: jito
       endpoint: "https://mainnet.block-engine.jito.wtf/api/v1/transactions"

@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 
 from benchmark.live_config import live_benchmark_config_from_dict
 from interfaces.core import Platform
+from monitoring.performance.config import (
+    InfrastructureProfile,
+    infrastructure_config_from_dict,
+)
 from utils.redaction import register_config_secrets
 
 # Existing validation rules (keeping all existing ones)
@@ -82,7 +86,7 @@ CONFIG_VALIDATION_RULES = [
 
 # Valid values for enum-like fields
 VALID_VALUES = {
-    "filters.listener_type": ["logs", "blocks", "geyser", "pumpportal"],
+    "filters.listener_type": ["logs", "blocks", "geyser", "pumpportal", "aggregate"],
     "cleanup.mode": ["disabled", "on_fail", "after_sell", "post_session"],
     "trade.exit_strategy": ["time_based", "tp_sl", "manual"],
     "platform": ["pump_fun", "lets_bonk"],
@@ -90,8 +94,8 @@ VALID_VALUES = {
 
 # Platform-specific listener compatibility
 PLATFORM_LISTENER_COMPATIBILITY = {
-    Platform.PUMP_FUN: ["logs", "blocks", "geyser", "pumpportal"],
-    Platform.LETS_BONK: ["blocks", "geyser", "pumpportal"],
+    Platform.PUMP_FUN: ["logs", "blocks", "geyser", "pumpportal", "aggregate"],
+    Platform.LETS_BONK: ["blocks", "geyser", "pumpportal", "aggregate"],
 }
 
 
@@ -202,6 +206,7 @@ def validate_config(config: dict) -> None:
     # otherwise a bad mint alias only surfaces on the first non-SOL coin.
     validate_quote_config(config)
 
+    routing = None
     execution = config.get("execution")
     if execution is not None:
         if not isinstance(execution, dict):
@@ -227,6 +232,21 @@ def validate_config(config: dict) -> None:
             raise ValueError("benchmark.allow_live_submission must be true or false")
         if "live_enabled" in benchmark:
             live_benchmark_config_from_dict(benchmark)
+
+    infrastructure = config.get("infrastructure")
+    if infrastructure is not None:
+        if not isinstance(infrastructure, dict):
+            raise ValueError("infrastructure must be a mapping")
+        parsed = infrastructure_config_from_dict(infrastructure)
+        if parsed.profile == InfrastructureProfile.MAXIMUM_PERFORMANCE:
+            if routing is None or not routing.enabled:
+                raise ValueError("maximum_performance requires execution.enabled: true")
+            if config.get("filters", {}).get("listener_type") != "aggregate":
+                raise ValueError(
+                    "maximum_performance requires filters.listener_type: aggregate"
+                )
+            if not config.get("risk", {}).get("enforce", False):
+                raise ValueError("maximum_performance requires risk.enforce: true")
 
     # Platform-specific validation
     platform_str = config.get("platform", "pump_fun")

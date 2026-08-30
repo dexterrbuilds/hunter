@@ -60,9 +60,9 @@ protocol path.
 | Protocols | Pump.fun bonding curve and LetsBonk |
 | Pump.fun trading | `buy_v2` and `sell_v2`, exact account layout, SOL and configured SPL quote assets |
 | Token programs | SPL Token and Token-2022-aware mint/account handling |
-| Detection | Solana `logsSubscribe`, `blockSubscribe`, Yellowstone Geyser, and PumpPortal |
+| Detection | Solana `logsSubscribe`, `blockSubscribe`, Yellowstone Geyser, PumpPortal, RabbitStream, Triton Riptide, and bounded Triton shred/sidecar ingress |
 | Quoting | Integer reserve calculations, price impact, explicit slippage, current Pump fee state |
-| Delivery | Standard Solana JSON-RPC by default; opt-in generic multi-RPC, Helius Sender, and Jito single-transaction adapters |
+| Delivery | Standard Solana JSON-RPC by default; opt-in generic multi-RPC, Helius Sender/Max, Triton Jet/SWQoS, and Jito single-transaction adapters |
 | Broadcast policies | `single`, `race`, `hedged`, and classified `fallback` |
 | Exits | Time-based exits and take-profit/stop-loss monitoring; manual mode retains the position |
 | Positions | SQLite persistence, partial exits, lifecycle history, restart reconciliation |
@@ -70,6 +70,7 @@ protocol path.
 | Risk | Trading switch, kill switch, trade/position/exposure caps, fee caps, wallet reserve, trade-rate limit |
 | Telemetry | Detection-to-land timing, provider attempts, blockhash age, fee settings, slots, confirmation progression |
 | Benchmarking | Offline replay, passive multi-detector observation, read-only transport probes, and guarded opt-in economic trials |
+| Maximum-performance profile | Regional multi-feed aggregation, exactly-once mint claiming, background execution caches, sender warm-up, readiness/degraded state, and capability-safe routing |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
@@ -106,6 +107,11 @@ as a separate execution variant and signed once for that variant.
 See [Execution providers](docs/execution-providers.md) and
 [Landing metrics](docs/landing-metrics.md) for the precise semantics.
 
+For the opt-in Amsterdam-oriented infrastructure profile, see
+[Maximum-performance deployment](docs/max-performance-deployment.md). The safe
+example remains disabled at
+[`config/examples/hunter-maximum-performance.yaml`](config/examples/hunter-maximum-performance.yaml).
+
 ### Persistence, recovery, and PnL
 
 Positions, fills, logical executions, signatures, blockhash validity, lifecycle
@@ -131,6 +137,7 @@ src/core/             Solana client, wallet, blockhash, and priority fees
 src/domain/           raw amounts, quotes, execution, lifecycle, accounting
 src/execution/        provider contracts, routing, telemetry, and metrics
 src/monitoring/       logs, blocks, Geyser, PumpPortal, and position monitors
+config/examples/      disabled infrastructure reference profiles
 src/platforms/        Pump.fun and LetsBonk protocol implementations
 src/storage/          SQLite schema, migrations, and repositories
 src/strategies/       exit decisions without transaction submission ownership

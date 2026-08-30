@@ -179,3 +179,50 @@ submission, confirmation, or WebSockets. Submission routing supports single,
 race, hedged, and safe fallback modes. See
 [execution-providers.md](execution-providers.md) and
 [landing-metrics.md](landing-metrics.md).
+
+## Maximum-performance infrastructure path
+
+The optional `maximum_performance` profile adds a bounded layer above existing
+listeners and below the trading coordinator:
+
+```text
+RabbitStream / Triton shreds / Riptide / fallback feeds
+                            |
+                  DetectionObservation
+                            |
+              EarliestEventAggregator
+              correlation + mint claim
+                            |
+             one TokenInfo callback only
+                            |
+                    existing trader
+                            |
+              one prepared signed variant
+                            |
+         capability-validated provider routing
+```
+
+`DetectionIdentity` uses mint as the stable economic key and enriches it with
+creation signature and launch slot when later feeds provide them. The
+aggregator's process-local lifecycle is `UNSEEN -> OBSERVED -> CLAIMED ->
+TRADE_REQUEST_CREATED`; durable logical execution and signature state remains
+in SQLite. This division lets later observations improve latency data without
+becoming a second buy authority.
+
+Fast-path state is classified as authoritative event state, authoritative plus
+versioned static state, requires refresh, or unsupported. The Pump.fun buyer
+records that classification and skips state reads only when both the assessment
+and `trust_create_event` permit it. Program instruction construction, fee/curve
+math, PumpPortal refresh, and LetsBonk paths remain unchanged.
+
+Submission adapters expose capabilities for message variants, tips, priority
+fees, SWQoS/direct-leader routing, and identical-signature races. The router
+rejects an incompatible race before dispatch. `ExecutionVariantPreparer`
+formalizes one build/sign/serialization result per variant, while existing
+Milestone 2 persistence remains the replacement authority.
+
+Startup readiness distinguishes required and optional feeds/senders, blockhash
+freshness, and signer initialization. A maximum-performance bot cannot enter
+the listener loop when required components are unavailable unless degraded
+operation was explicitly enabled. See
+[max-performance-deployment.md](max-performance-deployment.md).

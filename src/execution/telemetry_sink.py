@@ -28,11 +28,18 @@ class _TelemetryItem:
 class AsyncTelemetrySink:
     """Capture cheaply in memory, then serialize SQLite writes on a worker."""
 
-    def __init__(self, store: TelemetryStore) -> None:
+    def __init__(
+        self, store: TelemetryStore, *, maximum_queue_size: int = 8_192
+    ) -> None:
+        if maximum_queue_size <= 0:
+            raise ValueError("telemetry queue size must be positive")  # noqa: TRY003
         self.store = store
-        self._queue: asyncio.Queue[_TelemetryItem | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[_TelemetryItem | None] = asyncio.Queue(
+            maxsize=maximum_queue_size
+        )
         self._worker: asyncio.Task[None] | None = None
         self._failure: Exception | None = None
+        self.dropped_records = 0
 
     @property
     def running(self) -> bool:
@@ -45,11 +52,16 @@ class AsyncTelemetrySink:
                 self._run(), name="hunter-telemetry-writer"
             )
 
-    def record_nowait(self, telemetry: ExecutionTelemetry, attempt: int) -> None:
+    def record_nowait(self, telemetry: ExecutionTelemetry, attempt: int) -> bool:
         """Queue an immutable execution snapshot without disk I/O."""
         if self._worker is None or self._worker.done():
             raise RuntimeError("telemetry sink is not running")  # noqa: TRY003
-        self._queue.put_nowait(_TelemetryItem(deepcopy(telemetry), attempt))
+        try:
+            self._queue.put_nowait(_TelemetryItem(deepcopy(telemetry), attempt))
+        except asyncio.QueueFull:
+            self.dropped_records += 1
+            return False
+        return True
 
     async def record(self, telemetry: ExecutionTelemetry, attempt: int = 1) -> None:
         self.record_nowait(telemetry, attempt)
@@ -94,6 +106,7 @@ def provider_attempt_from_result(result: SubmissionResult) -> ProviderAttemptTel
     return ProviderAttemptTelemetry(
         provider_id=result.provider_id,
         endpoint_id=result.endpoint_id,
+        provider_region=result.provider_region,
         execution_variant=result.execution_variant,
         signature=result.signature,
         accepted=result.accepted,

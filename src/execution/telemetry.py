@@ -29,6 +29,8 @@ class DetectionTelemetry:
     """Observation timing from detector input through trade request creation."""
 
     source: str
+    source_region: str | None = None
+    transaction_signature: str | None = None
     event_observed_at: datetime = field(default_factory=utc_now)
     event_observed_mono_ns: int = field(default_factory=monotonic_ns)
     event_slot: int | None = None
@@ -41,6 +43,11 @@ class DetectionTelemetry:
     authoritative_refresh_started_mono_ns: int | None = None
     authoritative_refresh_completed_mono_ns: int | None = None
     account_read_duration_ms: float | None = None
+    socket_received_mono_ns: int | None = None
+    parser_completed_mono_ns: int | None = None
+    validation_completed_mono_ns: int | None = None
+    correlation_completed_mono_ns: int | None = None
+    claim_completed_mono_ns: int | None = None
 
     def mark_processing_started(self) -> None:
         self.hunter_processing_started_at = utc_now()
@@ -69,6 +76,7 @@ class ProviderAttemptTelemetry:
     accepted: bool
     acknowledgement: str
     bytes_sent: int
+    provider_region: str | None = None
     connection_reused: bool | None = None
     connection_session_generation: int | None = None
     connection_session_created: bool | None = None
@@ -99,6 +107,8 @@ class ExecutionTelemetry:
     execution_variant: str = "standard"
 
     detection_source: str | None = None
+    detection_source_region: str | None = None
+    creation_signature: str | None = None
     event_observed_at: datetime | None = None
     event_observed_mono_ns: int | None = None
     detection_slot: int | None = None
@@ -192,6 +202,8 @@ class ExecutionTelemetry:
         if detection is None:
             return
         self.detection_source = detection.source
+        self.detection_source_region = detection.source_region
+        self.creation_signature = detection.transaction_signature
         self.event_observed_at = detection.event_observed_at
         self.event_observed_mono_ns = detection.event_observed_mono_ns
         self.detected_at = detection.event_observed_at
@@ -208,6 +220,15 @@ class ExecutionTelemetry:
             detection.authoritative_refresh_completed_mono_ns
         )
         self.account_read_duration_ms = detection.account_read_duration_ms
+        if detection.parser_completed_mono_ns is not None:
+            self.attributes["detection_parser_ms"] = (
+                detection.parser_completed_mono_ns - detection.event_observed_mono_ns
+            ) / 1_000_000
+        if detection.validation_completed_mono_ns is not None:
+            self.attributes["detection_validation_ms"] = (
+                detection.validation_completed_mono_ns
+                - detection.event_observed_mono_ns
+            ) / 1_000_000
         if detection.trade_request_created_at is not None:
             self.trade_requested_at = detection.trade_request_created_at
             self.trade_requested_mono_ns = detection.trade_request_created_mono_ns

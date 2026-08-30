@@ -40,6 +40,8 @@ represent failures during construction, signing, transport, or confirmation.
 - `endpoint_id`: credential-free endpoint identifier
 - `logical_trade_id` and `execution_variant`
 - detector source, event/transaction/launch slots, and processing timestamps
+- detector region, creation signature, socket receipt, parser, validation,
+  correlation, and logical-claim monotonic timestamps
 - `transaction_signature`
 - `blockhash`
 - blockhash source provider, source slot, and age at submission
@@ -69,7 +71,8 @@ stage pairs. Missing stages produce no derived latency rather than a guessed
 value.
 
 `provider_attempts` records bytes leaving Hunter, acknowledgement type/time,
-provider response class, Hunter-side HTTP-session creation/reuse generation,
+provider response class, configured provider region, Hunter-side HTTP-session
+creation/reuse generation,
 and sanitized diagnostics for each transport. Session reuse does not claim
 visibility into a provider proxy's underlying TCP socket. See
 [landing-metrics.md](landing-metrics.md) for exact slot definitions and
@@ -78,3 +81,8 @@ visibility into a provider proxy's underlying TCP socket. See
 Provider comparisons must use equivalent submission and confirmation policies
 and report distributions, sample counts, failure rates, and observation period.
 The schema alone is not evidence that one provider is faster than another.
+
+Maximum-performance feed, UDP ingress, aggregate-observation, and asynchronous
+telemetry queues are bounded. Their drop counters are operational health
+signals and must be interpreted alongside latency distributions; a low latency
+sample with discarded observations is not a healthy result.
