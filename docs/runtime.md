@@ -20,6 +20,7 @@ HunterApplication
    |-- configured listener / earliest-event aggregator
    |-- optional tracked-wallet source and processor
    |-- optional launch/fleet application services
+   |-- optional private Telegram control service
    |-- bounded application events
    `-- task supervision and typed runtime status
 ```
@@ -64,6 +65,12 @@ or Telegram handlers and expose no raw provider client or signer material.
 `ApplicationEventBus` is bounded and asynchronous. Notification consumers never
 block transaction execution. Queue drops and consumer failures are counted.
 SQLite—not the event bus—remains authoritative for economic state.
+
+Optional control interfaces start only after recovery, warm-up, and core service
+activation. They start as supervised optional tasks and therefore cannot delay
+listener scheduling or alter economic readiness. Interface state appears in
+`RuntimeStatus`; a failure degrades only that interface. Shutdown rejects new
+control actions before core tasks stop and gives each interface a bounded close.
 
 ## Backpressure and reconnects
 

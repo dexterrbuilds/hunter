@@ -3,6 +3,36 @@
 Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
 
+## Resolved or materially improved in Milestone 4
+
+- Optional Telegram control authenticates numeric owner IDs before command
+  parsing, rejects non-private chats by default, and resolves the bot token only
+  from a named environment secret.
+- Economic chat actions use owner/chat-bound, monotonic-TTL, atomically claimed,
+  single-use server-side confirmations and revalidate application policy at the
+  final managed boundary.
+- Telegram polling and notifications are optional, bounded, asynchronous, and
+  excluded from detection, quote, build, sign, route, and send hot paths.
+- Runtime halt semantics remain authoritative: new exposure is blocked while
+  managed defensive exits can continue; Telegram adds no liquidation bypass.
+
+## Remaining Telegram risks
+
+- **Telegram account compromise remains operator compromise.** An allowlisted
+  account can request actions within Hunter's configured limits. Strong Telegram
+  2FA, a dedicated bot, enforced risk caps, and a limited-capital wallet remain
+  necessary.
+- **Bot API availability is external.** Commands and notifications can be late
+  or absent during an outage. Automatic execution continues and SQLite remains
+  authoritative.
+- **Pending confirmations are intentionally not durable.** Restart invalidates
+  them; the operator must issue a fresh command and review current state.
+- **Launch chat parsing is deployment supplied.** Hunter does not guess signer,
+  metadata, participant, or funding inputs. Without a typed resolver, `/launch`
+  fails safely.
+- **Telegram has not been connected live by this milestone's validation.** All
+  tests use fake updates, callbacks, application services, and transports.
+
 ## Resolved or materially improved in Milestone 3.8
 
 - Normal startup now runs through one composition root with explicit recovery,

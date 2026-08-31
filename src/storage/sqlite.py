@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from execution.telemetry import ExecutionTelemetry
 
 SCHEMA_VERSION = 4
+_MAX_EXECUTION_LIST_LIMIT = 200
 
 
 @dataclass(slots=True)
@@ -650,6 +651,28 @@ class SQLitePositionStore:
                 (logical_execution_id,),
             ).fetchone()
         return _row_to_execution(row) if row is not None else None
+
+    def get_execution_by_signature(self, signature: str) -> StoredExecution | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM executions WHERE signature = ?", (signature,)
+            ).fetchone()
+        return _row_to_execution(row) if row is not None else None
+
+    def list_executions(self, limit: int = 20) -> list[StoredExecution]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_EXECUTION_LIST_LIMIT
+        ):
+            raise ValueError(  # noqa: TRY003
+                "execution list limit must be between 1 and 200"
+            )
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM executions ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_row_to_execution(row) for row in rows]
 
     def attach_execution_position(
         self, logical_execution_id: str, position_id: str

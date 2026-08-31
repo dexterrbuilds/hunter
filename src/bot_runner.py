@@ -32,6 +32,7 @@ from config_loader import (
     validate_platform_listener_combination,
 )
 from core.pubkeys import resolve_quote_mint
+from telegram_control.factory import telegram_control_factories_from_config
 from trading.universal_trader import (
     DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
     UniversalTrader,
@@ -249,7 +250,12 @@ async def start_bot(config_path: str):
             infrastructure_config=cfg.get("infrastructure"),
         )
 
-        application = HunterApplication(cfg, trader)
+        control_factories = telegram_control_factories_from_config(cfg.get("telegram"))
+        application = HunterApplication(
+            cfg,
+            trader,
+            control_interface_factories=control_factories,
+        )
         runtime_signal_coordinator.register(application)
         try:
             await application.run()

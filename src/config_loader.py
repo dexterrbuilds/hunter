@@ -20,6 +20,7 @@ from monitoring.performance.config import (
     InfrastructureProfile,
     infrastructure_config_from_dict,
 )
+from telegram_control.config import telegram_config_from_dict
 from utils.redaction import register_config_secrets
 
 # Existing validation rules (keeping all existing ones)
@@ -262,6 +263,7 @@ def validate_config(config: dict) -> None:
             isinstance(wallet_fleet, dict) and wallet_fleet.get("enabled", False)
         ),
     )
+    telegram_config_from_dict(config.get("telegram"))
 
     # Platform-specific validation
     platform_str = config.get("platform", "pump_fun")

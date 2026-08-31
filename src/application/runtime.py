@@ -9,8 +9,12 @@ import asyncio
 import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from decimal import ROUND_FLOOR, Decimal
 from time import monotonic_ns
 from typing import Any, Protocol
+from uuid import uuid4
+
+from solders.pubkey import Pubkey
 
 from application.milestone37_config import (
     validate_token_launch_config,
@@ -29,12 +33,21 @@ from application.runtime_models import (
 )
 from application.runtime_supervisor import RuntimeTaskSupervisor
 from application.wallet_tracking import AsyncWalletEventStore, TrackedWalletService
+from core.pubkeys import TOKEN_DECIMALS, WSOL_MINT, quote_decimals, resolve_quote_mint
+from domain.amounts import (
+    BasisPoints,
+    QuoteAmountRaw,
+    RoundingDirection,
+    TokenAmountRaw,
+)
 from domain.intents import (
     EconomicActionClass,
+    ExecutionUrgency,
     TradeAction,
     TradeIntent,
     TradeIntentSource,
     classify_economic_action,
+    default_urgency,
 )
 from domain.launch import LaunchExecutionPlan, TokenLaunchRequest
 from execution.errors import ErrorClassification, ExecutionError
@@ -75,6 +88,22 @@ class RuntimeTrader(Protocol):
     ) -> object: ...
 
 
+class RuntimeControlInterface(Protocol):
+    """Optional interface lifecycle; trading never depends on its readiness."""
+
+    name: str
+
+    def set_state_observer(
+        self, observer: Callable[[str, str | None], None]
+    ) -> None: ...
+
+    async def start(self) -> None: ...
+
+    def stop_accepting(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
 TraderFactory = Callable[[dict[str, Any]], RuntimeTrader]
 OrchestrationFactory = Callable[
     [
@@ -84,6 +113,8 @@ OrchestrationFactory = Callable[
     ],
     tuple[object | None, object | None, object | None],
 ]
+ControlInterfaceFactory = Callable[["HunterApplication"], RuntimeControlInterface]
+_BASIS_POINTS_SCALE = 10_000
 
 
 @dataclass(slots=True)
@@ -100,7 +131,7 @@ class RuntimeFeatures:
 class HunterApplication:
     """Compose, recover, warm, supervise, and stop one Hunter bot instance."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         config: dict[str, Any],
         trader: RuntimeTrader,
@@ -112,6 +143,7 @@ class HunterApplication:
         ]
         | None = None,
         orchestration_factory: OrchestrationFactory | None = None,
+        control_interface_factories: tuple[ControlInterfaceFactory, ...] = (),
     ) -> None:
         self.config = config
         self.bot_id = str(config.get("name", "hunter"))
@@ -132,6 +164,8 @@ class HunterApplication:
         self._startup_timings: list[StartupPhaseTiming] = []
         self._listener_states: dict[str, ComponentStatus] = {}
         self._provider_states: dict[str, ComponentStatus] = {}
+        self._control_states: dict[str, ComponentStatus] = {}
+        self._control_interfaces: list[RuntimeControlInterface] = []
         self._shutdown_lock = asyncio.Lock()
         self._started = False
         self._tracked_source_factory = tracked_source_factory
@@ -142,6 +176,7 @@ class HunterApplication:
             self.trader.runtime_authorizer = self.authorize_economic_action
         composition_started = monotonic_ns()
         self._validate_and_compose()
+        self._compose_control_interfaces(control_interface_factories)
         self._startup_timings.append(
             StartupPhaseTiming(
                 "configuration_and_persistence",
@@ -261,12 +296,32 @@ class HunterApplication:
         if fleet_exit is not None and hasattr(fleet_exit, "submission_authorizer"):
             fleet_exit.submission_authorizer = self.authorize_trade_intent
 
+    def _compose_control_interfaces(
+        self, factories: tuple[ControlInterfaceFactory, ...]
+    ) -> None:
+        for factory in factories:
+            interface = factory(self)
+            if interface.name in self._control_states:
+                raise ValueError(f"duplicate control interface: {interface.name}")
+            interface.set_state_observer(
+                lambda state, reason, name=interface.name: self._control_state_changed(
+                    name, state, reason
+                )
+            )
+            self._control_interfaces.append(interface)
+            self._control_states[interface.name] = ComponentStatus(
+                interface.name,
+                RuntimeComponentState.CONFIGURED,
+                required=False,
+            )
+
     async def start(self, *, start_detection: bool = True) -> None:
         """Cross the recovery barrier, warm infrastructure, then start services."""
         if self._started:
             return
         self._started = True
         await self.event_bus.start()
+        self._emit("RuntimeStarted")
         try:
             await self._phase(
                 ApplicationState.RECOVERY_RUNNING, self.trader.recover_runtime
@@ -287,6 +342,14 @@ class HunterApplication:
             # Open the application gate before scheduling producers. Required
             # producer failures immediately move the state back out of READY.
             self._transition(self._ready_state())
+            # Optional interfaces must never delay token detection or economic
+            # recovery. They own bounded startup timeouts and report status.
+            if self._control_interfaces:
+                self.supervisor.create(
+                    f"control-interfaces:{self.bot_id}",
+                    self._start_control_interfaces(),
+                    policy=TaskFailurePolicy.OPTIONAL,
+                )
             source = self.features.tracked_wallet_source
             if source is not None:
                 await source.start()
@@ -307,8 +370,9 @@ class HunterApplication:
                     self.trader.run_detection(),
                     policy=TaskFailurePolicy.CRITICAL,
                 )
-        except Exception:
+        except Exception as error:
             self._transition(ApplicationState.FAILED)
+            self._emit("RuntimeFailed", error=type(error).__name__)
             await self.shutdown()
             raise
 
@@ -339,6 +403,17 @@ class HunterApplication:
             source=intent.source.value,
             mint=str(intent.mint),
         )
+        source_event = {
+            TradeIntentSource.TRACKED_WALLET_CREATE: "TrackedWalletCreate",
+            TradeIntentSource.TRACKED_WALLET_BUY: "TrackedWalletBuy",
+        }.get(intent.source)
+        if source_event is not None:
+            self._emit(
+                source_event,
+                intent_id=intent.intent_id,
+                source=intent.source.value,
+                mint=str(intent.mint),
+            )
         try:
             result = await self.trader.execute_intent(intent, token_info)
         except Exception as error:
@@ -349,6 +424,32 @@ class HunterApplication:
             )
             raise
         self._emit("ExecutionConfirmed", intent_id=intent.intent_id)
+        result_signature = str(getattr(result, "signature", "") or "")
+        event_type = (
+            "PositionOpened" if intent.action == TradeAction.BUY else "PositionClosed"
+        )
+        self._emit(
+            event_type,
+            intent_id=intent.intent_id,
+            source=intent.source.value,
+            mint=str(intent.mint),
+            position_id=intent.position_id,
+            signature=result_signature or None,
+        )
+        exit_event = {
+            TradeIntentSource.TAKE_PROFIT: "TakeProfitTriggered",
+            TradeIntentSource.STOP_LOSS: "StopLossTriggered",
+            TradeIntentSource.TIMED_EXIT: "TimedExitTriggered",
+            TradeIntentSource.EMERGENCY_EXIT: "EmergencyExitTriggered",
+        }.get(intent.source)
+        if exit_event is not None:
+            self._emit(
+                exit_event,
+                intent_id=intent.intent_id,
+                mint=str(intent.mint),
+                position_id=intent.position_id,
+                signature=result_signature or None,
+            )
         return result
 
     async def _dispatch_intent_without_token(self, intent: TradeIntent) -> object:
@@ -415,12 +516,19 @@ class HunterApplication:
                 return
             self.trading_enabled = False
             self._transition(ApplicationState.SHUTTING_DOWN)
+            self._emit("RuntimeShuttingDown")
+            for interface in self._control_interfaces:
+                interface.stop_accepting()
             await self.supervisor.shutdown(timeout_seconds)
             source = self.features.tracked_wallet_source
             if source is not None:
                 await source.close()
             await self.trader.shutdown_runtime()
             await self.event_bus.close(flush=True)
+            await asyncio.gather(
+                *(interface.close() for interface in self._control_interfaces),
+                return_exceptions=True,
+            )
             self._transition(ApplicationState.STOPPED)
 
     def enable_trading(self) -> None:
@@ -449,6 +557,166 @@ class HunterApplication:
 
     def get_position(self, position_id: str) -> object:
         return self.trader.position_service.get_position(position_id)
+
+    def get_realized_pnl(self, position_id: str) -> dict[str, int | None]:
+        return self.trader.position_service.get_realized_pnl(position_id)
+
+    def list_executions(self, limit: int = 20) -> list[object]:
+        return list(self.trader.position_store.list_executions(limit))
+
+    def get_execution(self, identity: str) -> object:
+        execution = self.trader.position_store.get_execution(identity)
+        if execution is None:
+            execution = self.trader.position_store.get_execution_by_signature(identity)
+        if execution is None:
+            raise KeyError(f"unknown execution: {identity}")
+        return execution
+
+    def get_settings(self) -> dict[str, Any]:
+        return dict(self.trader.position_store.get_settings())
+
+    def risk_settings(self) -> dict[str, Any]:
+        limits = self.trader.risk_service.limits
+        return {
+            "enforce": limits.enforce,
+            "trading_enabled": limits.trading_enabled,
+            "emergency_kill_switch": limits.emergency_kill_switch,
+            "maximum_buy_raw_by_quote": {
+                str(key): value
+                for key, value in limits.maximum_buy_raw_by_quote.items()
+            },
+            "maximum_position_raw_by_quote": {
+                str(key): value
+                for key, value in limits.maximum_position_raw_by_quote.items()
+            },
+            "maximum_aggregate_exposure_raw_by_quote": {
+                str(key): value
+                for key, value in limits.maximum_aggregate_exposure_raw_by_quote.items()
+            },
+            "maximum_total_transaction_fee_lamports": (
+                limits.maximum_total_transaction_fee_lamports
+            ),
+            "maximum_priority_fee_lamports": limits.maximum_priority_fee_lamports,
+            "minimum_wallet_reserve_lamports": limits.minimum_wallet_reserve_lamports,
+            "maximum_trades_per_interval": limits.maximum_trades_per_interval,
+            "trade_interval_seconds": limits.trade_interval_seconds,
+        }
+
+    async def wallet_balances(self) -> tuple[dict[str, object], ...]:
+        balance = await self.trader.solana_client.get_wallet_balance_lamports(
+            self.trader.wallet.pubkey
+        )
+        return (
+            {
+                "alias": "primary",
+                "public_key": str(self.trader.wallet.pubkey),
+                "lamports": balance,
+                "status": "ready" if self.recovery_complete else "recovering",
+            },
+        )
+
+    def prepare_manual_buy(
+        self, mint: str, amount: str, quote: str | None = None
+    ) -> TradeIntent:
+        token_mint = Pubkey.from_string(mint)
+        quote_mint = resolve_quote_mint(quote or str(WSOL_MINT))
+        spend = QuoteAmountRaw.from_decimal(
+            amount,
+            mint=quote_mint,
+            decimals=quote_decimals(quote_mint),
+            rounding=RoundingDirection.DOWN,
+        )
+        if spend.value <= 0:
+            raise ValueError("manual buy amount must be positive")
+        source = TradeIntentSource.MANUAL_BUY
+        return TradeIntent(
+            action=TradeAction.BUY,
+            source=source,
+            mint=token_mint,
+            wallet_id="primary",
+            quote_mint=quote_mint,
+            quote_amount=spend,
+            token_decimals=TOKEN_DECIMALS,
+            slippage=_fraction_to_bps(self.trader.buy_slippage),
+            urgency=default_urgency(source),
+            intent_id=f"manual-buy:{uuid4()}",
+        )
+
+    def prepare_manual_sell(self, position_id: str, percentage: str) -> TradeIntent:
+        position = self.get_position(position_id)
+        text = percentage.strip().removesuffix("%")
+        percent = Decimal(text)
+        if not percent.is_finite() or not Decimal("0") < percent <= Decimal("100"):
+            raise ValueError("sell percentage must be greater than 0 and at most 100")
+        percentage_bps = int(
+            (percent * Decimal(100)).to_integral_value(rounding=ROUND_FLOOR)
+        )
+        accounting = position.accounting
+        remaining = accounting.remaining_quantity_raw
+        quantity = (
+            remaining
+            if percentage_bps == _BASIS_POINTS_SCALE
+            else remaining * percentage_bps // _BASIS_POINTS_SCALE
+        )
+        if quantity <= 0:
+            raise ValueError("sell percentage resolves to zero raw tokens")
+        source = TradeIntentSource.MANUAL_SELL
+        return TradeIntent(
+            action=TradeAction.SELL,
+            source=source,
+            mint=accounting.token_mint,
+            wallet_id="primary",
+            quote_mint=accounting.quote_mint,
+            token_amount=TokenAmountRaw(
+                quantity, accounting.token_mint, accounting.token_decimals
+            ),
+            position_id=accounting.position_id,
+            slippage=_fraction_to_bps(self.trader.sell_slippage),
+            urgency=ExecutionUrgency.NORMAL,
+            intent_id=f"manual-sell:{uuid4()}",
+        )
+
+    def preview_manual_trade(self, intent: TradeIntent) -> dict[str, object]:
+        self.authorize_trade_intent(intent)
+        if intent.action == TradeAction.SELL:
+            position = self.get_position(intent.position_id or "")
+            accounting = position.accounting
+            if accounting.token_mint != intent.mint:
+                raise ValueError("managed position mint does not match sell intent")
+            if (
+                intent.token_amount is None
+                or intent.token_amount.value <= 0
+                or intent.token_amount.value > accounting.remaining_quantity_raw
+            ):
+                raise ValueError("sell amount exceeds managed remaining inventory")
+        else:
+            positions = self.list_positions()
+            existing = sum(
+                item.accounting.remaining_cost_basis_raw
+                for item in positions
+                if item.accounting.token_mint == intent.mint
+                and item.accounting.quote_mint == intent.quote_mint
+            )
+            aggregate = sum(
+                item.accounting.remaining_cost_basis_raw
+                for item in positions
+                if item.accounting.quote_mint == intent.quote_mint
+            )
+            self.trader.risk_service.assess_entry_exposure(
+                quote_mint=intent.quote_mint,
+                input_raw=intent.quote_amount.value,
+                existing_position_exposure_raw=existing,
+                aggregate_exposure_raw=aggregate,
+            )
+        return {
+            "intent_id": intent.intent_id,
+            "source": intent.source.value,
+            "mint": str(intent.mint),
+            "wallet": intent.wallet_id,
+            "slippage_bps": intent.slippage.value,
+            "risk": "preliminary_pass; exact fees and balance revalidate at execution",
+            "execution_mode": "managed runtime route",
+        }
 
     def list_tracked_wallets(self) -> tuple[str, ...]:
         service = self.features.tracked_wallet_service
@@ -482,7 +750,13 @@ class HunterApplication:
         service = self.features.token_launch_service
         if service is None:
             raise ValueError("token launch runtime is disabled")
-        return await service.execute(request, **values)
+        result = await service.execute(request, **values)
+        self._emit(
+            "LaunchSubmitted",
+            mint=str(request.mint),
+            plan_id=LaunchExecutionPlan.from_request(request).plan_id,
+        )
+        return result
 
     def fleet_positions(self, plan_id: str) -> list[dict]:
         """Return persisted fleet positions through the application boundary."""
@@ -500,7 +774,9 @@ class HunterApplication:
         service = self.features.wallet_fleet_exit_service
         if service is None:
             raise ValueError("wallet fleet exit runtime is disabled")
-        return await service.execute_exit(**values)
+        result = await service.execute_exit(**values)
+        self._emit("FleetExitStatus", plan_id=str(values.get("plan_id", "")))
+        return result
 
     def runtime_status(self) -> RuntimeStatus:
         """Return a typed snapshot containing no credentials or raw clients."""
@@ -545,6 +821,7 @@ class HunterApplication:
             tip_cache_ready=None,
             listeners=tuple(self._listener_states.values()),
             providers=tuple(self._provider_states.values()),
+            control_interfaces=tuple(self._control_states.values()),
             tracked_wallet=self._listener_states.get("tracked_wallet"),
             active_bots=(self.bot_id,),
             open_positions=sum(
@@ -567,6 +844,28 @@ class HunterApplication:
         self._startup_timings.append(
             StartupPhaseTiming(state.value, (monotonic_ns() - started) / 1_000_000)
         )
+
+    async def _start_control_interfaces(self) -> None:
+        for interface in self._control_interfaces:
+            self._control_states[interface.name] = ComponentStatus(
+                interface.name,
+                RuntimeComponentState.STARTING,
+                required=False,
+            )
+            try:
+                await interface.start()
+            except Exception as error:  # noqa: BLE001
+                self._control_states[interface.name] = ComponentStatus(
+                    interface.name,
+                    RuntimeComponentState.FAILED,
+                    required=False,
+                    reason=type(error).__name__,
+                )
+                self._emit(
+                    "ControlInterfaceFailed",
+                    interface=interface.name,
+                    error=type(error).__name__,
+                )
 
     def _ready_state(self) -> ApplicationState:
         ready_states = {
@@ -617,6 +916,14 @@ class HunterApplication:
     def _detection_state_changed(self, state: str, reason: str | None) -> None:
         self._set_primary_listener_state(RuntimeComponentState(state), reason)
         self._transition(self._ready_state())
+
+    def _control_state_changed(self, name: str, state: str, reason: str | None) -> None:
+        parsed = RuntimeComponentState(state)
+        self._control_states[name] = ComponentStatus(
+            name, parsed, required=False, reason=reason
+        )
+        if parsed in {RuntimeComponentState.DEGRADED, RuntimeComponentState.FAILED}:
+            self._emit("ControlInterfaceDegraded", interface=name, reason=reason)
 
     def _set_primary_listener_state(
         self,
@@ -717,3 +1024,15 @@ class RuntimeSignalCoordinator:
 
 
 runtime_signal_coordinator = RuntimeSignalCoordinator()
+
+
+def _fraction_to_bps(value: object) -> BasisPoints:
+    fraction = Decimal(str(value))
+    if not fraction.is_finite() or not Decimal(0) <= fraction <= Decimal(1):
+        raise ValueError("configured slippage fraction must be between 0 and 1")
+    raw = int(
+        (fraction * Decimal(_BASIS_POINTS_SCALE)).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
+    return BasisPoints(raw)

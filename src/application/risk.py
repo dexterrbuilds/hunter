@@ -79,24 +79,11 @@ class RiskService:
             return
         quote = plan.quote_mint
         if plan.side == ExecutionSide.BUY:
-            if limits.emergency_kill_switch:
-                raise _risk_error("emergency kill switch is active")
-            if not limits.trading_enabled:
-                raise _risk_error("trading is disabled")
-            self._guard_optional_max(
-                plan.input_raw,
-                limits.maximum_buy_raw_by_quote.get(quote),
-                "buy amount",
-            )
-            self._guard_optional_max(
-                context.existing_position_exposure_raw + plan.input_raw,
-                limits.maximum_position_raw_by_quote.get(quote),
-                "position size",
-            )
-            self._guard_optional_max(
-                context.aggregate_exposure_raw + plan.input_raw,
-                limits.maximum_aggregate_exposure_raw_by_quote.get(quote),
-                "aggregate exposure",
+            self.assess_entry_exposure(
+                quote_mint=quote,
+                input_raw=plan.input_raw,
+                existing_position_exposure_raw=context.existing_position_exposure_raw,
+                aggregate_exposure_raw=context.aggregate_exposure_raw,
             )
 
         fee = context.fee_exposure
@@ -126,6 +113,38 @@ class RiskService:
                     retryable=False,
                 )
         self._guard_rate_limit()
+
+    def assess_entry_exposure(
+        self,
+        *,
+        quote_mint: Pubkey,
+        input_raw: int,
+        existing_position_exposure_raw: int,
+        aggregate_exposure_raw: int,
+    ) -> None:
+        """Preview entry-state and exposure caps without pretending fees are known."""
+        limits = self.limits
+        if not limits.enforce:
+            return
+        if limits.emergency_kill_switch:
+            raise _risk_error("emergency kill switch is active")
+        if not limits.trading_enabled:
+            raise _risk_error("trading is disabled")
+        self._guard_optional_max(
+            input_raw,
+            limits.maximum_buy_raw_by_quote.get(quote_mint),
+            "buy amount",
+        )
+        self._guard_optional_max(
+            existing_position_exposure_raw + input_raw,
+            limits.maximum_position_raw_by_quote.get(quote_mint),
+            "position size",
+        )
+        self._guard_optional_max(
+            aggregate_exposure_raw + input_raw,
+            limits.maximum_aggregate_exposure_raw_by_quote.get(quote_mint),
+            "aggregate exposure",
+        )
 
     def record_trade(self) -> None:
         if self.limits.enforce:

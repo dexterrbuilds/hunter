@@ -1,0 +1,15 @@
+# Safe Telegram control example. Merge this block into a bot configuration.
+# The token value itself belongs only in the environment variable named below.
+telegram:
+  enabled: false
+  owner_user_ids: []
+  private_chat_only: true
+  token_env_var: TELEGRAM_BOT_TOKEN
+  confirmation_ttl_seconds: 45
+  kill_confirmation_ttl_seconds: 20
+  maximum_pending_actions: 64
+  notification_queue_size: 256
+  command_limit: 30
+  command_interval_seconds: 60
+  notification_categories:
+    - all

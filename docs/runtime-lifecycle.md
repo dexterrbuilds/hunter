@@ -82,7 +82,14 @@ Shutdown is idempotent and bounded:
 5. Stop monitors and background estimators.
 6. Flush persistence and queued telemetry.
 7. Close provider/RPC sessions and SQLite.
-8. Enter `STOPPED`.
+8. Boundedly drain and close optional control interfaces.
+9. Enter `STOPPED`.
+
+Optional Telegram startup is scheduled after core services become active but is
+not awaited by detection startup. This preserves the invariant that Bot API
+latency or failure cannot delay automatic trading or managed exits. During
+shutdown, Telegram stops accepting commands and invalidates pending nonces
+before supervised economic producers are stopped.
 
 A submitted transaction cannot be cancelled. Its logical execution ID,
 signature, blockhash, and validity state remain available to recovery; shutdown

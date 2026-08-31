@@ -49,9 +49,9 @@ The project is being developed around four rules:
    correctness requires it.
 
 Hunter is not tied to Telegram, a specific RPC vendor, or one execution
-transport. The trading, risk, position, storage, and execution layers are being
-kept interface-neutral so other front ends can be added without rewriting the
-protocol path.
+transport. Its optional private Telegram service calls the same
+interface-neutral trading, risk, position, storage, and execution layers as
+every other trigger.
 
 ## Capability map
 
@@ -75,6 +75,7 @@ protocol path.
 | Tracked wallets | Independent Pump.fun CREATE snipes and BUY copies, bounded decoding, durable duplicate claims, explicit sizing |
 | Launch/fleet foundation | Pump.fun `create_v2`, ordered creator/participant buy plans, Jito bundle transport, fleet accounting and coordinated exits; disabled by default |
 | Runtime composition | Recovery barrier, infrastructure warm-up, readiness/degraded states, feature gates, bounded events, task supervision, concurrent bot instances, and graceful shutdown |
+| Private Telegram control | Optional numeric-owner/private-chat commands, staged economic confirmation, runtime controls, managed trades, status, and non-blocking notifications |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
@@ -153,12 +154,14 @@ Tracked-wallet mode is part of this normal lifecycle when enabled; no standalone
 script is required. Token-launch and wallet-fleet orchestration remain disabled
 by default and require an explicit signer/provider composition rather than
 guessing security-sensitive dependencies. The framework-neutral status,
-control, launch-preview, manual-trade, fleet, and event APIs are intended for a
-later interface layer—Telegram is not implemented.
+control, launch-preview, manual-trade, fleet, and event APIs now back an optional
+private-owner Telegram adapter. Telegram failure never gates automatic
+execution, and disabled Telegram creates no client.
 
 See [Runtime composition](docs/runtime.md),
 [Runtime lifecycle](docs/runtime-lifecycle.md), and
-[Production readiness](docs/production-readiness.md).
+[Production readiness](docs/production-readiness.md). Telegram setup and command
+semantics are documented in [Private Telegram control](docs/telegram.md).
 
 For the opt-in Amsterdam-oriented infrastructure profile, see
 [Maximum-performance deployment](docs/max-performance-deployment.md). The safe
@@ -194,6 +197,7 @@ config/examples/      disabled infrastructure reference profiles
 src/platforms/        Pump.fun and LetsBonk protocol implementations
 src/storage/          SQLite schema, migrations, and repositories
 src/strategies/       exit decisions without transaction submission ownership
+src/telegram_control/ private-owner commands, confirmations, and notifications
 src/trading/          current compatibility coordinator and trade services
 tests/                fully offline test suite
 ```
@@ -480,11 +484,9 @@ and the `--allow-live` flag. See [Controlled live benchmark](docs/live-benchmark
 
 To keep the project honest, these are not current features:
 
-- Telegram control or notifications
 - Web UI, public API, or interactive CLI trading
-- A production-startup or user-interface composition for tracked-wallet and
-  launch/fleet services (the tested services and disabled config foundation now
-  exist)
+- Free-form Telegram launch construction; launch submission requires the
+  existing deployment-supplied typed launch resolver and orchestration services
 - Automatic token-selection strategies beyond the existing filters
 - Production-proven provider ranking
 - Production-proven multi-wallet launch/fleet operation
@@ -502,13 +504,11 @@ To keep the project honest, these are not current features:
 - Complete integer/raw-unit migration for remaining LetsBonk and extreme-fast
   monetary paths.
 - Strengthen interrupted-buy recovery and portfolio loss/drawdown controls.
-- Compose tracked-wallet monitoring and launch/fleet services behind an explicit
-  operator interface only after controlled live validation.
+- Continue controlled live validation of tracked-wallet and launch/fleet
+  services before production capital is considered.
 
 ### Later
 
-- A personal Telegram interface for balances, buys, sells, positions, PnL,
-  settings, transaction history, and notifications.
 - Strategy-managed take profit, stop loss, trailing stop, and filters backed by
   persisted positions—not chat state.
 - Additional interfaces such as a local CLI, web dashboard, or private API that
@@ -538,6 +538,7 @@ measurements from the intended deployment environment.
 | [Architecture](docs/architecture.md) | Module boundaries, amounts, quoting, accounting, persistence, lifecycle |
 | [Runtime composition](docs/runtime.md) | Dependency ownership, feature gates, tracked wallets, control and events |
 | [Runtime lifecycle](docs/runtime-lifecycle.md) | Recovery barrier, readiness, task failure, reconnect, shutdown |
+| [Private Telegram control](docs/telegram.md) | Owner security, commands, confirmations, notifications, lifecycle |
 | [Production readiness](docs/production-readiness.md) | Implemented/offline-tested/runtime-composed versus live-validated status |
 | [Execution interfaces](docs/execution-interfaces.md) | Account, blockhash, builder, signer, submitter, confirmation contracts |
 | [Execution providers](docs/execution-providers.md) | Standard RPC, Helius, Jito, routing, identity, connection reuse |

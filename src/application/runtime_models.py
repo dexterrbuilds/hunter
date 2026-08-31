@@ -29,6 +29,8 @@ class RuntimeComponentState(StrEnum):
     """Connection and service state reported without provider secrets."""
 
     CONFIGURED = "configured"
+    DISABLED = "disabled"
+    STARTING = "starting"
     CONNECTING = "connecting"
     CONNECTED = "connected"
     RECEIVING = "receiving"
@@ -82,6 +84,7 @@ class RuntimeStatus:
     tip_cache_ready: bool | None
     listeners: tuple[ComponentStatus, ...]
     providers: tuple[ComponentStatus, ...]
+    control_interfaces: tuple[ComponentStatus, ...]
     tracked_wallet: ComponentStatus | None
     active_bots: tuple[str, ...]
     open_positions: int
