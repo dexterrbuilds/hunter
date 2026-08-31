@@ -1,12 +1,13 @@
 """Streaming Pump.fun wallet activity decoding and bounded dispatch."""
 
-# ruff: noqa: C901, PLC0415, TC001
+# ruff: noqa: C901, PLC0415, PLR0913, TC001
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from time import monotonic_ns
@@ -25,6 +26,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 ActivityHandler = Callable[[WalletActivity, TokenInfo | None], Awaitable[None]]
+StateObserver = Callable[[str, str | None], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,16 +194,21 @@ class TrackedWalletLogSource:
         processor: TrackedWalletProcessor,
         *,
         reconnect_delay_seconds: float = 1.0,
+        maximum_reconnect_delay_seconds: float = 30.0,
+        state_observer: StateObserver | None = None,
     ) -> None:
         self.wss_endpoint = wss_endpoint
         self.wallets = wallets
         self.processor = processor
         self.reconnect_delay_seconds = reconnect_delay_seconds
+        self.maximum_reconnect_delay_seconds = maximum_reconnect_delay_seconds
+        self.state_observer = state_observer
         self._tasks: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
         if self._tasks:
             return
+        self._observe("connecting")
         await self.processor.start()
         self._tasks = [
             asyncio.create_task(
@@ -209,6 +216,8 @@ class TrackedWalletLogSource:
             )
             for wallet in self.wallets
         ]
+        for task in self._tasks:
+            task.add_done_callback(self._task_completed)
 
     async def close(self) -> None:
         for task in self._tasks:
@@ -216,10 +225,23 @@ class TrackedWalletLogSource:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         await self.processor.close()
+        self._observe("stopped")
+
+    def _observe(self, state: str, reason: str | None = None) -> None:
+        if self.state_observer is not None:
+            self.state_observer(state, reason)
+
+    def _task_completed(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._observe("failed", type(error).__name__)
 
     async def _listen(self, wallet: Pubkey) -> None:
         import websockets
 
+        delay = self.reconnect_delay_seconds
         while True:
             try:
                 async with websockets.connect(self.wss_endpoint) as websocket:
@@ -237,6 +259,8 @@ class TrackedWalletLogSource:
                         )
                     )
                     await websocket.recv()
+                    delay = self.reconnect_delay_seconds
+                    self._observe("connected")
                     while True:
                         message = json.loads(await websocket.recv())
                         params = message.get("params", {})
@@ -252,6 +276,7 @@ class TrackedWalletLogSource:
                             and isinstance(logs, list)
                             and all(isinstance(item, str) for item in logs)
                         ):
+                            self._observe("receiving")
                             await self.processor.submit(
                                 WalletTransactionObservation(
                                     signature=signature,
@@ -264,10 +289,14 @@ class TrackedWalletLogSource:
             except asyncio.CancelledError:
                 raise
             except websockets.ConnectionClosed:
-                await asyncio.sleep(self.reconnect_delay_seconds)
+                self._observe("degraded", "connection_closed")
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.1))  # noqa: S311
+                delay = min(delay * 2, self.maximum_reconnect_delay_seconds)
             except (json.JSONDecodeError, OSError, TimeoutError) as error:
                 logger.warning(
                     "Tracked-wallet stream reconnecting after %s",
                     type(error).__name__,
                 )
-                await asyncio.sleep(self.reconnect_delay_seconds)
+                self._observe("degraded", type(error).__name__)
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.1))  # noqa: S311
+                delay = min(delay * 2, self.maximum_reconnect_delay_seconds)

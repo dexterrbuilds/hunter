@@ -31,6 +31,12 @@ prevent duplicate source signatures from creating duplicate intents across a
 restart. SQLite claim/completion work is moved to worker threads so it does not
 block the async listener loop.
 
+Milestone 3.8 composes this path into normal `HunterApplication` startup when
+`wallet_tracking.enabled` is true. Subscription handshake, receiving,
+degradation, reconnect, and stop states appear in the typed runtime snapshot.
+Reconnect uses bounded exponential backoff with jitter; durable claims remain
+the replay authority.
+
 ## Sizing
 
 - `fixed`: use the exact configured raw/decimal quote amount;

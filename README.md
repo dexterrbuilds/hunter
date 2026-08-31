@@ -74,6 +74,7 @@ protocol path.
 | Universal trade intents | Common trigger-neutral path for launch, tracked-wallet, manual, YOLO, managed exit, emergency, and fleet actions |
 | Tracked wallets | Independent Pump.fun CREATE snipes and BUY copies, bounded decoding, durable duplicate claims, explicit sizing |
 | Launch/fleet foundation | Pump.fun `create_v2`, ordered creator/participant buy plans, Jito bundle transport, fleet accounting and coordinated exits; disabled by default |
+| Runtime composition | Recovery barrier, infrastructure warm-up, readiness/degraded states, feature gates, bounded events, task supervision, concurrent bot instances, and graceful shutdown |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
@@ -134,6 +135,26 @@ explicitly partial-landing risks. See
 [Universal fast execution](docs/universal-fast-execution.md),
 [Tracked wallets](docs/wallet-tracking.md), and
 [Token launch and wallet fleets](docs/token-launch-and-wallet-fleet.md).
+
+### Application runtime
+
+Normal startup now runs through one `HunterApplication` composition root. It
+opens SQLite, completes restart recovery, warms required execution
+infrastructure, activates monitors and enabled services, and only then permits
+new economic intents. Runtime readiness and trading permission are separate, so
+Hunter can operate as a read-only observer with feeds, telemetry, recovery, and
+status active while transaction submission remains disabled.
+
+Tracked-wallet mode is part of this normal lifecycle when enabled; no standalone
+script is required. Token-launch and wallet-fleet orchestration remain disabled
+by default and require an explicit signer/provider composition rather than
+guessing security-sensitive dependencies. The framework-neutral status,
+control, launch-preview, manual-trade, fleet, and event APIs are intended for a
+later interface layer—Telegram is not implemented.
+
+See [Runtime composition](docs/runtime.md),
+[Runtime lifecycle](docs/runtime-lifecycle.md), and
+[Production readiness](docs/production-readiness.md).
 
 For the opt-in Amsterdam-oriented infrastructure profile, see
 [Maximum-performance deployment](docs/max-performance-deployment.md). The safe
@@ -273,7 +294,9 @@ uv run src/bot_runner.py
 ```
 
 Hunter loads enabled YAML files from `bots/`. Configurations with
-`separate_process: true` run in isolated processes. Runtime logs are written to
+`separate_process: true` run in isolated processes; other enabled configurations
+start concurrently with isolated wallet, strategy, persistence, listener, and
+monitor state. Runtime logs are written to
 `logs/`, and the default position database is `data/hunter.sqlite3`; both are
 ignored by Git.
 
@@ -509,6 +532,9 @@ measurements from the intended deployment environment.
 | Document | Purpose |
 | --- | --- |
 | [Architecture](docs/architecture.md) | Module boundaries, amounts, quoting, accounting, persistence, lifecycle |
+| [Runtime composition](docs/runtime.md) | Dependency ownership, feature gates, tracked wallets, control and events |
+| [Runtime lifecycle](docs/runtime-lifecycle.md) | Recovery barrier, readiness, task failure, reconnect, shutdown |
+| [Production readiness](docs/production-readiness.md) | Implemented/offline-tested/runtime-composed versus live-validated status |
 | [Execution interfaces](docs/execution-interfaces.md) | Account, blockhash, builder, signer, submitter, confirmation contracts |
 | [Execution providers](docs/execution-providers.md) | Standard RPC, Helius, Jito, routing, identity, connection reuse |
 | [Execution telemetry](docs/execution-telemetry.md) | Durable schema, monotonic timing, provider attempts, fee fields |

@@ -29,11 +29,17 @@ from core.pubkeys import (
     resolve_quote_mint,
 )
 from core.wallet import Wallet
-from domain.intents import ExecutionUrgency, TradeIntentSource
+from domain.amounts import BasisPoints, QuoteAmountRaw, TokenAmountRaw
+from domain.intents import (
+    ExecutionUrgency,
+    TradeAction,
+    TradeIntent,
+    TradeIntentSource,
+)
 from domain.lifecycle import ExecutionState, PositionStatus, is_retryable
-from domain.quotes import ExecutionSide
+from domain.quotes import ExecutionResult, ExecutionSide
 from execution.detection import detection_for
-from execution.errors import ErrorClassification
+from execution.errors import ErrorClassification, ExecutionError
 from execution.providers.config import ProviderRole
 from execution.providers.factory import routing_config_from_dict
 from execution.telemetry_sink import AsyncTelemetrySink
@@ -392,6 +398,12 @@ class UniversalTrader:
             if item.accounting.status != PositionStatus.CLOSED
         }
         self.pending_sell_signatures: dict[str, str] = {}
+        self._runtime_recovered = False
+        self._runtime_warmed = False
+        self._runtime_active = False
+        self._runtime_closed = False
+        self.detection_state_observer = None
+        self.runtime_authorizer = None
 
     async def _risk_exposure(
         self, token_mint: Pubkey, quote_mint: Pubkey
@@ -411,6 +423,91 @@ class UniversalTrader:
                 existing += accounting.remaining_cost_basis_raw
         return existing, aggregate
 
+    async def execute_intent(
+        self, intent: TradeIntent, token_info: TokenInfo | None = None
+    ) -> ExecutionResult:
+        """Execute a runtime intent through the existing managed trade path.
+
+        Listener, tracked-wallet, and future interface adapters use this
+        boundary rather than selecting an RPC sender directly. Token creation
+        events may provide complete authoritative ``TokenInfo``; tracked BUY
+        events intentionally force the existing curve refresh.
+        """
+        if intent.action == TradeAction.SELL:
+            if intent.token_amount is None or intent.position_id is None:
+                raise ExecutionError(
+                    ErrorClassification.CONFIGURATION_ERROR,
+                    "sell intent is missing position or exact token amount",
+                )
+            stored = self.position_service.get_position(intent.position_id)
+            info = token_info or self._token_info_from_metadata(
+                stored.strategy_metadata
+            )
+            if info is None:
+                raise ExecutionError(
+                    ErrorClassification.MALFORMED_EVENT_STATE,
+                    "persisted position lacks token execution metadata",
+                )
+            accounting = stored.accounting
+            remaining = accounting.remaining_quantity_raw
+            reference_price = (
+                accounting.remaining_cost_basis_raw
+                / max(1, remaining)
+                * 10 ** (accounting.token_decimals - accounting.quote_decimals)
+            )
+            result = await self._execute_managed_sell(
+                info,
+                token_amount=float(intent.token_amount.to_decimal()),
+                token_price=max(reference_price, 1 / 10**accounting.quote_decimals),
+                logical_execution_id=intent.logical_execution_id,
+                intent_source=intent.source,
+                execution_urgency=intent.urgency,
+                token_amount_override=intent.token_amount,
+                slippage_override=intent.slippage,
+            )
+            if not result.success or result.execution_result is None:
+                raise ExecutionError(
+                    result.error_classification or ErrorClassification.UNKNOWN,
+                    result.error_message
+                    or "managed sell did not produce execution effects",
+                )
+            return result.execution_result
+        if intent.action != TradeAction.BUY:
+            raise ExecutionError(
+                ErrorClassification.CONFIGURATION_ERROR,
+                "launch intents require TokenLaunchService",
+            )
+        if intent.quote_amount is None or intent.quote_mint is None:
+            raise ExecutionError(
+                ErrorClassification.CONFIGURATION_ERROR,
+                "buy intent is missing its exact quote amount",
+            )
+        info = token_info or TokenInfo(
+            name="tracked-wallet token",
+            symbol="TRACKED",
+            uri="",
+            mint=intent.mint,
+            platform=self.platform,
+            quote_mint=intent.quote_mint,
+            state_from_event=False,
+        )
+        result = await self._execute_managed_buy(
+            info,
+            logical_execution_id=intent.logical_execution_id,
+            intent_source=intent.source,
+            execution_urgency=intent.urgency,
+            quote_amount_override=intent.quote_amount,
+            slippage_override=intent.slippage,
+        )
+        if not result.success or result.execution_result is None:
+            raise ExecutionError(
+                result.error_classification or ErrorClassification.UNKNOWN,
+                result.error_message or "managed buy did not produce execution effects",
+                retryable=False,
+            )
+        await self._handle_successful_buy(info, result, background_monitor=True)
+        return result.execution_result
+
     def _record_telemetry(self, telemetry) -> None:
         """Persist completed RPC telemetry after the confirmation hot path."""
         try:
@@ -424,9 +521,37 @@ class UniversalTrader:
             logger.exception("Failed to persist execution telemetry")
 
     async def start(self) -> None:
-        """Start the trading bot and listen for new tokens."""
+        """Start the backward-compatible runtime lifecycle and detection loop."""
         logger.info(f"Starting Universal Trader for {self.platform.value}")
+        try:
+            await self.recover_runtime()
+            await self.warm_runtime()
+            await self.activate_runtime()
+            await self.run_detection()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Trading stopped due to error")
+        finally:
+            await self.shutdown_runtime()
+            logger.info("Universal Trader has shut down")
+
+    async def recover_runtime(self) -> None:
+        """Recover durable state while economic monitor workers are stopped."""
+        if self._runtime_recovered:
+            return
         await self.telemetry_sink.start()
+        await self._recover_positions()
+        self._runtime_recovered = True
+
+    async def warm_runtime(self) -> None:
+        """Warm fee, RPC, blockhash, and configured sender infrastructure."""
+        if self._runtime_warmed:
+            return
+        if not self._runtime_recovered:
+            raise RuntimeError(  # noqa: TRY003
+                "runtime recovery must complete before warm-up"
+            )
         await self.priority_fee_manager.start()
         logger.info(
             f"Match filter: {self.match_string if self.match_string else 'None'}"
@@ -459,6 +584,7 @@ class UniversalTrader:
             logger.warning(f"RPC warm-up failed: {e!s}")
 
         provider_warmup = await self.solana_client.warm_execution_providers()
+        self.solana_client.provider_warmup_results = provider_warmup
         if provider_warmup:
             logger.info(
                 "Execution provider connection warm-up: %s",
@@ -467,10 +593,24 @@ class UniversalTrader:
 
         if self.infrastructure.profile == InfrastructureProfile.MAXIMUM_PERFORMANCE:
             await self._verify_maximum_performance_readiness(provider_warmup)
+        self._runtime_warmed = True
 
+    async def activate_runtime(self) -> None:
+        """Start queued position monitors after the recovery barrier opens."""
+        if self._runtime_active:
+            return
+        if not self._runtime_recovered or not self._runtime_warmed:
+            raise RuntimeError(  # noqa: TRY003
+                "runtime must recover and warm before activation"
+            )
         await self.position_monitor_manager.start()
-        await self._recover_positions()
+        self._runtime_active = True
 
+    async def run_detection(self) -> None:
+        """Run the configured detector after runtime services are active."""
+        if not self._runtime_active:
+            raise RuntimeError("runtime services are not active")  # noqa: TRY003
+        self._observe_detection_state("connecting")
         try:
             # Choose operating mode based on yolo_mode
             if not self.yolo_mode:
@@ -506,17 +646,30 @@ class UniversalTrader:
                     )
                 except Exception:
                     logger.exception("Token listening stopped due to error")
+                    raise
                 finally:
                     for processor_task in processor_tasks:
                         processor_task.cancel()
                     await asyncio.gather(*processor_tasks, return_exceptions=True)
 
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logger.exception("Trading stopped due to error")
+            logger.exception("Token detection stopped due to error")
+            raise
 
-        finally:
-            await self._cleanup_resources()
-            logger.info("Universal Trader has shut down")
+    async def shutdown_runtime(self) -> None:
+        """Close owned resources exactly once."""
+        if self._runtime_closed:
+            return
+        self._runtime_closed = True
+        await self._cleanup_resources()
+        self._runtime_active = False
+
+    def _observe_detection_state(self, state: str, reason: str | None = None) -> None:
+        observer = getattr(self, "detection_state_observer", None)
+        if observer is not None:
+            observer(state, reason)
 
     async def _verify_maximum_performance_readiness(
         self, provider_warmup: dict[str, bool]
@@ -572,6 +725,7 @@ class UniversalTrader:
 
         async def token_callback(token: TokenInfo) -> None:
             nonlocal found_token
+            self._observe_detection_state("receiving")
             token_key = str(token.mint)
 
             # Only process if not already processed and fresh
@@ -863,6 +1017,7 @@ class UniversalTrader:
 
     async def _queue_token(self, token_info: TokenInfo) -> None:
         """Queue a token for processing if not already processed."""
+        self._observe_detection_state("receiving")
         token_key = str(token_info.mint)
 
         if token_key in self.processed_tokens or token_key in self.queued_tokens:
@@ -989,15 +1144,23 @@ class UniversalTrader:
         except Exception:
             logger.exception(f"Error handling token {token_info.symbol}")
 
-    async def _execute_managed_buy(
+    async def _execute_managed_buy(  # noqa: PLR0913
         self,
         token_info: TokenInfo,
         *,
         logical_execution_id: str | None = None,
         intent_source: TradeIntentSource | str | None = None,
         execution_urgency: ExecutionUrgency = ExecutionUrgency.HIGH,
+        quote_amount_override: QuoteAmountRaw | None = None,
+        slippage_override: BasisPoints | None = None,
     ) -> TradeResult:
         """Persist logical buy identity before waiting for confirmation."""
+        source = intent_source or (
+            TradeIntentSource.YOLO
+            if getattr(self, "yolo_mode", False)
+            else TradeIntentSource.LAUNCH_SNIPE
+        )
+        self._authorize_runtime_source(source)
         if not hasattr(self, "position_store"):
             return await self.buyer.execute(token_info)
         logical_execution_id = logical_execution_id or f"buy:{token_info.mint}"
@@ -1034,6 +1197,8 @@ class UniversalTrader:
                 ),
             ),
             execution_urgency=execution_urgency.value,
+            quote_amount_override=quote_amount_override,
+            slippage_override=slippage_override,
         )
         if result.success:
             self.position_store.update_execution(
@@ -1056,7 +1221,11 @@ class UniversalTrader:
         return result
 
     async def _handle_successful_buy(
-        self, token_info: TokenInfo, buy_result: TradeResult
+        self,
+        token_info: TokenInfo,
+        buy_result: TradeResult,
+        *,
+        background_monitor: bool = False,
     ) -> None:
         """Handle successful token purchase."""
         logger.info(
@@ -1138,7 +1307,7 @@ class UniversalTrader:
         if not self.marry_mode:
             if self.exit_strategy in {"tp_sl", "time_based"}:
                 position_id = self.active_position_ids.get(mint_str, mint_str)
-                if self.yolo_mode:
+                if self.yolo_mode or background_monitor:
                     await self.position_monitor_manager.submit(
                         position_id, monitor_exit
                     )
@@ -1418,8 +1587,11 @@ class UniversalTrader:
         logical_execution_id: str | None = None,
         intent_source: TradeIntentSource | str = TradeIntentSource.MANUAL_SELL,
         execution_urgency: ExecutionUrgency = ExecutionUrgency.NORMAL,
+        token_amount_override: TokenAmountRaw | None = None,
+        slippage_override: BasisPoints | None = None,
     ) -> TradeResult:
         """Persist sell lifecycle and inspect ambiguous signatures before retry."""
+        self._authorize_runtime_source(intent_source)
         if not hasattr(self, "active_position_ids"):
             # Offline Milestone 1 verification harnesses construct a minimal
             # coordinator without persistence; preserve their call contract.
@@ -1501,6 +1673,8 @@ class UniversalTrader:
                 else str(intent_source)
             ),
             execution_urgency=execution_urgency.value,
+            token_amount_override=token_amount_override,
+            slippage_override=slippage_override,
         )
         if result.tx_signature:
             self.pending_sell_signatures[mint_key] = str(result.tx_signature)
@@ -1557,6 +1731,17 @@ class UniversalTrader:
                 position_id, target, classification.value
             )
         return result
+
+    def _authorize_runtime_source(self, source: TradeIntentSource | str) -> None:
+        authorizer = getattr(self, "runtime_authorizer", None)
+        if authorizer is None:
+            return
+        normalized = (
+            source
+            if isinstance(source, TradeIntentSource)
+            else TradeIntentSource(str(source))
+        )
+        authorizer(normalized)
 
     def _get_pool_address(self, token_info: TokenInfo) -> Pubkey:
         """Get the pool/curve address for price monitoring using platform-agnostic method."""

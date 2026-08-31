@@ -34,11 +34,15 @@ strategies -> exit decisions -> SellService
 positions <-> PositionService <-> SQLitePositionStore
 ```
 
-`UniversalTrader` remains a compatibility coordinator during the incremental
-split. Its active Pump path now uses the same raw quotes, risk checks, execution
+`HunterApplication` is the normal startup composition root. `UniversalTrader`
+remains a compatibility coordinator during the incremental split, but startup
+is now exposed as recovery, warm-up, service activation, detection, and
+shutdown phases owned by the application lifecycle. Its active Pump path uses
+the same raw quotes, risk checks, execution
 effects, persistence, recovery, logical transaction identity, bounded token
-workers, and bounded position monitors. New interfaces should depend on
-`TradingEngine`, not on `UniversalTrader` or a listener.
+workers, and bounded position monitors. New interfaces should depend on the
+framework-neutral application APIs and `TradingEngine`, not on a listener or
+provider client. See [runtime.md](runtime.md).
 
 ## Universal intent boundary
 

@@ -31,6 +31,11 @@ execution coordinator and Milestone 3.6 provider stack. A few standalone
 learning-example harnesses retain their legacy direct calls by design; they are
 not a second production performance stack.
 
+`HunterApplication` is now the runtime gate above that coordinator. Recovery,
+readiness, trading permission, and kill-switch checks occur once at the
+application boundary; dependency resolution and configuration parsing are not
+repeated on the transaction hot path.
+
 ## Fast does not mean guessed
 
 Universal fast execution removes unnecessary synchronous work. It does not

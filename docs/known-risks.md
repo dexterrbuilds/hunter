@@ -3,6 +3,38 @@
 Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
 
+## Resolved or materially improved in Milestone 3.8
+
+- Normal startup now runs through one composition root with explicit recovery,
+  infrastructure warm-up, activation, detection, and shutdown phases.
+- Recovered position monitors are queued while workers are stopped, closing the
+  window in which an exit could run before recovery completed.
+- Tracked-wallet CREATE and BUY are feature-gated and composed into normal
+  startup with connection state, bounded reconnect, durable claims, and exact
+  intent dispatch through the managed execution boundary.
+- Runtime status, trading control, kill switch, application events, and task
+  failure are framework-neutral and contain no credential-bearing endpoints.
+- Multiple non-isolated bot configurations start concurrently while retaining
+  bot-scoped wallet, persistence, strategy, listener, and monitor state.
+
+## Remaining runtime-composition risks
+
+- **Launch/fleet signer composition is deployment supplied.** Enabling these
+  features without a complete signer, balance, buy-component, bundle, and
+  accounting factory fails before listeners start. Orchestration remains
+  offline tested; the console runtime does not guess security-sensitive inputs.
+- **Cross-bot provider sessions are not pooled.** Each bot owns client and
+  rate-limit state. This is explicit and safe, but same-process bots can create
+  redundant connections until a credential-aware lease pool exists.
+- **Legacy listener connection state is partial.** Primary listeners report
+  connecting and first valid receive; not every inherited adapter exports its
+  transport handshake to application status.
+- **Component-owned task crashes are not all centralized.** Top-level detection
+  is supervised; blockhash, fee, telemetry, and monitor managers retain their
+  established ownership and error reporting.
+- **Forced termination can prevent non-critical telemetry flush.** Submitted
+  transaction identity remains durable, but process-manager grace is required.
+
 ## Resolved or materially improved in Milestone 3.7
 
 - A provider-neutral `TradeIntent` carries trigger source and urgency into the
@@ -27,9 +59,9 @@ improvements from risks that remain open; it is not exhaustive.
 
 ## Remaining wallet-tracking and fleet risks
 
-- **The new orchestration services are disabled and not composed into normal
-  startup by default.** They are application boundaries with offline tests, not
-  a production launch command or Telegram feature.
+- **Launch/fleet economic services remain disabled by default.** The runtime
+  exposes framework-neutral boundaries, but no launch command or Telegram
+  feature is shipped.
 - **Portable tracked-wallet monitoring uses processed logs.** Milestone 3.6
   feeds can emit the same normalized observation, but provider-specific wallet
   subscriptions still need deployment composition and regional measurement.

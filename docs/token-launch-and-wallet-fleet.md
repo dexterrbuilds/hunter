@@ -1,9 +1,12 @@
 # Pump.fun token launch and wallet fleets
 
-Milestone 3.7 introduces application boundaries for an operator-controlled
-Pump.fun launch and its wallet fleet. They are disabled by default and are not
-wired to normal bot startup or a public CLI. Metadata upload is outside this
-service: the launch request accepts an already hosted `https://`, `ipfs://`, or
+Hunter provides application boundaries for an operator-controlled Pump.fun
+launch and wallet fleet. They remain disabled by default and no public CLI or
+Telegram command is provided. Milestone 3.8 adds composition/control hooks, but
+an enabled deployment must supply its explicit signer registry, balance reader,
+authoritative buy-component factory, bundle transport, and landing accounting;
+startup fails rather than guessing any of them. Metadata upload is outside this
+service: a launch request accepts an already hosted `https://`, `ipfs://`, or
 `ar://` URI.
 
 ## Launch plan

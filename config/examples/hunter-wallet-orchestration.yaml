@@ -1,5 +1,7 @@
-# Hunter Milestone 3.7 reference only. Nothing here is enabled or runnable.
-# Copy deliberately into private bot configuration and replace placeholders.
+# Hunter runtime orchestration reference. Every economic action remains disabled.
+# Copy deliberately into a private bot configuration and replace placeholders.
+# Wallet tracking is composed by normal startup when enabled. Launch/fleet also
+# require the deployment's explicit signer/orchestration composition.
 wallet_tracking:
   enabled: false
   duplicate_policy: ignore_existing_position

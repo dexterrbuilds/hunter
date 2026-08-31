@@ -314,6 +314,8 @@ class PlatformAwareBuyer(Trader):
         submission_recorder: SubmissionRecorder | None = None,
         intent_source: str = "launch_snipe",
         execution_urgency: str = "high",
+        quote_amount_override: QuoteAmountRaw | None = None,
+        slippage_override: BasisPoints | None = None,
     ) -> TradeResult:
         """Execute buy operation using platform-specific implementations."""
         telemetry: ExecutionTelemetry | None = None
@@ -460,8 +462,15 @@ class PlatformAwareBuyer(Trader):
             # A coin paired against a quote asset we have no configured amount
             # for cannot be traded — spending `amount` of it would be a
             # different order of magnitude entirely.
-            quote_amount = self._resolve_quote_amount(quote_mint)
-            if quote_amount is None:
+            if (
+                quote_amount_override is not None
+                and quote_amount_override.mint != quote_mint
+            ):
+                raise ValueError(  # noqa: TRY003, TRY301
+                    "buy intent quote mint does not match curve quote mint"
+                )
+            configured_quote_amount = self._resolve_quote_amount(quote_mint)
+            if quote_amount_override is None and configured_quote_amount is None:
                 return TradeResult(
                     success=False,
                     platform=token_info.platform,
@@ -473,6 +482,17 @@ class PlatformAwareBuyer(Trader):
 
             quote_unit = quote_units_per_token(quote_mint)
             quote_label = _quote_symbol(quote_mint)
+            if quote_amount_override is not None:
+                quote_amount_raw = quote_amount_override.value
+                quote_amount = quote_amount_raw / quote_unit
+            else:
+                quote_amount = configured_quote_amount
+                quote_amount_raw = int(quote_amount * quote_unit)
+            slippage = slippage_override or _fraction_to_basis_points(self.slippage)
+            slippage_fraction = slippage.value / 10_000
+            compatibility_slippage_fraction = (
+                self.slippage if slippage_override is None else slippage_fraction
+            )
 
             # Both branches need the resolved quote amount to finish sizing the
             # trade: extreme_fast_mode fixes the token count and back-derives an
@@ -485,7 +505,7 @@ class PlatformAwareBuyer(Trader):
                 token_amount = self.extreme_fast_token_amount
                 token_price_sol = quote_amount / token_amount if token_amount > 0 else 0
             elif exact_curve is not None and exact_fee_schedule is not None:
-                spend = QuoteAmountRaw.from_decimal(
+                spend = quote_amount_override or QuoteAmountRaw.from_decimal(
                     Decimal(str(quote_amount)),
                     mint=quote_mint,
                     decimals=exact_curve.quote_decimals,
@@ -496,7 +516,7 @@ class PlatformAwareBuyer(Trader):
                     curve=exact_curve,
                     fee_rates=exact_fee_schedule.select_for_buy_budget(exact_curve),
                     trade_fee_rates=exact_fee_schedule.select(exact_curve),
-                    slippage=_fraction_to_basis_points(self.slippage),
+                    slippage=slippage,
                 )
                 if buy_quote.minimum_output.value <= 0:
                     raise ValueError("Exact Pump buy quote produced zero token output")
@@ -513,13 +533,22 @@ class PlatformAwareBuyer(Trader):
             if buy_quote is None:
                 # Compatibility path for LetsBonk and zero-RPC extreme-fast
                 # mode. Pump's normal path above uses exact integer reserves.
-                minimum_token_amount = token_amount * (1 - self.slippage)
+                minimum_token_amount = token_amount * (
+                    1 - compatibility_slippage_fraction
+                )
                 minimum_token_amount_raw = int(
                     minimum_token_amount * 10**TOKEN_DECIMALS
                 )
-                max_quote_amount_raw = int(
-                    quote_amount * quote_unit * (1 + self.slippage)
-                )
+                if quote_amount_override is not None or slippage_override is not None:
+                    max_quote_amount_raw = (
+                        quote_amount_raw * (10_000 + slippage.value) + 9_999
+                    ) // 10_000
+                else:
+                    max_quote_amount_raw = int(
+                        quote_amount
+                        * quote_unit
+                        * (1 + compatibility_slippage_fraction)
+                    )
             if telemetry is not None:
                 telemetry.attributes["quote_generation_ms"] = (
                     monotonic_ns() - quote_started
@@ -1013,6 +1042,8 @@ class PlatformAwareSeller(Trader):
         submission_recorder: SubmissionRecorder | None = None,
         intent_source: str = "manual_sell",
         execution_urgency: str = "normal",
+        token_amount_override: TokenAmountRaw | None = None,
+        slippage_override: BasisPoints | None = None,
     ) -> TradeResult:
         """Execute sell operation using platform-specific implementations.
 
@@ -1175,9 +1206,25 @@ class PlatformAwareSeller(Trader):
             quote_label = _quote_symbol(quote_mint)
 
             # Use pre-known amount and price (no RPC delay)
-            token_balance_decimal = token_amount
-            token_balance = int(token_amount * 10**TOKEN_DECIMALS)
+            if (
+                token_amount_override is not None
+                and token_amount_override.mint != token_info.mint
+            ):
+                raise ValueError(  # noqa: TRY003, TRY301
+                    "sell intent token mint does not match position mint"
+                )
+            if token_amount_override is not None:
+                token_balance = token_amount_override.value
+                token_balance_decimal = token_balance / 10**TOKEN_DECIMALS
+            else:
+                token_balance = int(token_amount * 10**TOKEN_DECIMALS)
+                token_balance_decimal = token_amount
             token_price_sol = token_price
+            slippage = slippage_override or _fraction_to_basis_points(self.slippage)
+            slippage_fraction = slippage.value / 10_000
+            compatibility_slippage_fraction = (
+                self.slippage if slippage_override is None else slippage_fraction
+            )
             sell_quote = None
             execution_plan = None
 
@@ -1210,7 +1257,7 @@ class PlatformAwareSeller(Trader):
                     ),
                     curve=exact_curve,
                     fee_rates=exact_fee_schedule.select(exact_curve),
-                    slippage=_fraction_to_basis_points(self.slippage),
+                    slippage=slippage,
                 )
                 if sell_quote.minimum_output.value <= 0:
                     raise ValueError(
@@ -1227,7 +1274,10 @@ class PlatformAwareSeller(Trader):
                 expected_quote_output = token_balance_decimal * token_price_sol
                 min_quote_output = max(
                     1,
-                    int((expected_quote_output * (1 - self.slippage)) * quote_unit),
+                    int(
+                        (expected_quote_output * (1 - compatibility_slippage_fraction))
+                        * quote_unit
+                    ),
                 )
             if telemetry is not None:
                 telemetry.attributes["quote_generation_ms"] = (
@@ -1240,7 +1290,7 @@ class PlatformAwareSeller(Trader):
                 f"Expected {quote_label} output: {expected_quote_output:.10f} {quote_label}"
             )
             logger.info(
-                f"Minimum {quote_label} output (with {self.slippage * 100:.1f}% slippage): "
+                f"Minimum {quote_label} output (with {compatibility_slippage_fraction * 100:.1f}% slippage): "
                 f"{min_quote_output / quote_unit:.10f} {quote_label} "
                 f"({min_quote_output} raw units)"
             )

@@ -1,6 +1,6 @@
 """Convert tracked Pump.fun activity into universal trade intents."""
 
-# ruff: noqa: PLR0911, TC001, TRY300
+# ruff: noqa: PLR0911, TRY300
 
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ class PositionLookup(Protocol):
 
 WalletBalanceProvider = Callable[[str, Pubkey], Awaitable[int]]
 IntentExecutor = Callable[[TradeIntent], Awaitable[object]]
+ContextualIntentExecutor = Callable[[TradeIntent, TokenInfo | None], Awaitable[object]]
 
 
 @dataclass(slots=True)
@@ -55,6 +56,7 @@ class TrackedWalletService:
     store: WalletEventStore
     positions: PositionLookup
     execute_intent: IntentExecutor
+    execute_intent_with_token: ContextualIntentExecutor | None = None
     wallet_balance_provider: WalletBalanceProvider | None = None
     _wallets: dict[Pubkey, TrackedWallet] = field(init=False, repr=False)
 
@@ -99,7 +101,10 @@ class TrackedWalletService:
                 intent_id=intent.intent_id,
                 reason=None,
             )
-            await self.execute_intent(intent)
+            if self.execute_intent_with_token is not None:
+                await self.execute_intent_with_token(intent, token_info)
+            else:
+                await self.execute_intent(intent)
             await self.store.complete_wallet_event(
                 activity.event_id,
                 state="executed",

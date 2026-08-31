@@ -1100,6 +1100,39 @@ class SQLitePositionStore:
             item["marry_mode"] = bool(item["marry_mode"])
         return result
 
+    def runtime_counts(self) -> dict[str, int]:
+        """Return lightweight non-secret counts for runtime status snapshots."""
+        pending_states = (
+            ExecutionState.PLANNED.value,
+            ExecutionState.BUILDING.value,
+            ExecutionState.SIGNED.value,
+            ExecutionState.RPC_ACCEPTED.value,
+            ExecutionState.SIGNATURE_RECEIVED.value,
+            ExecutionState.PROCESSED.value,
+            ExecutionState.TIMED_OUT.value,
+            ExecutionState.NOT_OBSERVED.value,
+            ExecutionState.DROPPED_UNKNOWN.value,
+        )
+        placeholders = ",".join("?" for _ in pending_states)
+        with self._lock:
+            active_fleets = self._connection.execute(
+                "SELECT COUNT(DISTINCT plan_id) FROM fleet_positions "
+                "WHERE status = 'active'"
+            ).fetchone()[0]
+            pending_executions = self._connection.execute(
+                f"SELECT COUNT(*) FROM executions WHERE state IN ({placeholders})",  # noqa: S608
+                pending_states,
+            ).fetchone()[0]
+            reconciliation = self._connection.execute(
+                "SELECT COUNT(*) FROM positions WHERE status = ?",
+                (PositionStatus.RECONCILIATION_REQUIRED.value,),
+            ).fetchone()[0]
+        return {
+            "active_fleets": int(active_fleets),
+            "pending_executions": int(pending_executions),
+            "pending_reconciliation": int(reconciliation),
+        }
+
     def claim_fleet_exit(
         self,
         *,

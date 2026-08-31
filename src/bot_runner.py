@@ -24,6 +24,7 @@ except ImportError:
     )
 
 from application.risk import RiskLimits
+from application.runtime import HunterApplication, runtime_signal_coordinator
 from config_loader import (
     get_platform_from_config,
     load_bot_config,
@@ -248,7 +249,12 @@ async def start_bot(config_path: str):
             infrastructure_config=cfg.get("infrastructure"),
         )
 
-        await trader.start()
+        application = HunterApplication(cfg, trader)
+        runtime_signal_coordinator.register(application)
+        try:
+            await application.run()
+        finally:
+            runtime_signal_coordinator.unregister(application)
 
     except Exception as e:
         logging.exception(f"Failed to initialize or start trader: {e}")
@@ -259,7 +265,7 @@ def run_bot_process(config_path):
     asyncio.run(start_bot(config_path))
 
 
-def run_all_bots():
+def run_all_bots():  # noqa: C901, PLR0915
     """Run all bots defined in YAML files in the 'bots' directory."""
     bot_dir = Path("bots")
     if not bot_dir.exists():
@@ -274,6 +280,7 @@ def run_all_bots():
     logging.info(f"Found {len(bot_files)} bot configuration files")
 
     processes = []
+    local_configs: list[str] = []
     skipped_bots = 0
 
     for file in bot_files:
@@ -334,7 +341,7 @@ def run_all_bots():
                 logging.info(
                     f"Starting bot '{bot_name}' ({platform.value}) in main process"
                 )
-                asyncio.run(start_bot(str(file)))
+                local_configs.append(str(file))
 
         except Exception as e:
             logging.exception(f"Failed to start bot from {file}: {e}")
@@ -343,6 +350,13 @@ def run_all_bots():
     logging.info(
         f"Started {len(bot_files) - skipped_bots} bots, skipped {skipped_bots} disabled/invalid bots"
     )
+
+    if local_configs:
+
+        async def run_local_bots() -> None:
+            await asyncio.gather(*(start_bot(path) for path in local_configs))
+
+        asyncio.run(run_local_bots())
 
     # Wait for all processes to complete
     for p in processes:
