@@ -23,8 +23,13 @@ from application.runtime_models import (
     TaskFailurePolicy,
 )
 from application.runtime_supervisor import RuntimeTaskSupervisor
-from domain.amounts import BasisPoints, QuoteAmountRaw
-from domain.intents import TradeAction, TradeIntent, TradeIntentSource
+from domain.amounts import BasisPoints, QuoteAmountRaw, TokenAmountRaw
+from domain.intents import (
+    EconomicActionClass,
+    TradeAction,
+    TradeIntent,
+    TradeIntentSource,
+)
 from domain.wallet_tracking import WalletActivity, WalletActivityType
 from execution.errors import ExecutionError
 from interfaces.core import Platform, TokenInfo
@@ -99,6 +104,7 @@ class FakeTrader:
         self.detection_started = asyncio.Event()
         self.detection_release = asyncio.Event()
         self.detection_state_observer = None
+        self.runtime_authorizer = None
 
     async def recover_runtime(self) -> None:
         self.calls.append("recover")
@@ -123,9 +129,44 @@ class FakeTrader:
     async def execute_intent(
         self, intent: TradeIntent, token_info: TokenInfo | None = None
     ) -> object:
+        if self.runtime_authorizer is not None:
+            self.runtime_authorizer(
+                intent.source,
+                intent.action,
+                managed_exit=(
+                    intent.action == TradeAction.SELL and intent.position_id is not None
+                ),
+            )
         self.calls.append("execute")
         self.intents.append((intent, token_info))
         self.position_service.open_mints.add(intent.mint)
+        return SimpleNamespace(success=True, signature="fake-signature")
+
+
+class PausedBoundaryTrader(FakeTrader):
+    """Pause between application dispatch and the final managed boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.boundary_reached = asyncio.Event()
+        self.boundary_release = asyncio.Event()
+        self.submissions = 0
+
+    async def execute_intent(
+        self, intent: TradeIntent, token_info: TokenInfo | None = None
+    ) -> object:
+        del token_info
+        self.boundary_reached.set()
+        await self.boundary_release.wait()
+        if self.runtime_authorizer is not None:
+            self.runtime_authorizer(
+                intent.source,
+                intent.action,
+                managed_exit=(
+                    intent.action == TradeAction.SELL and intent.position_id is not None
+                ),
+            )
+        self.submissions += 1
         return SimpleNamespace(success=True, signature="fake-signature")
 
 
@@ -198,7 +239,48 @@ def buy_intent(source: TradeIntentSource = TradeIntentSource.YOLO) -> TradeInten
     )
 
 
+def sell_intent(
+    source: TradeIntentSource = TradeIntentSource.MANUAL_SELL,
+) -> TradeIntent:
+    return TradeIntent(
+        action=TradeAction.SELL,
+        source=source,
+        mint=MINT,
+        wallet_id="primary",
+        quote_mint=QUOTE,
+        token_amount=TokenAmountRaw(1_000_000, MINT, 6),
+        position_id="position:owned",
+        slippage=BasisPoints(100),
+        intent_id=f"intent:{source.value}",
+    )
+
+
 class RuntimeCompositionTests(unittest.IsolatedAsyncioTestCase):
+    def test_all_intent_sources_have_explicit_exposure_classification(self) -> None:
+        entries = {
+            TradeIntentSource.LAUNCH_SNIPE,
+            TradeIntentSource.TRACKED_WALLET_CREATE,
+            TradeIntentSource.TRACKED_WALLET_BUY,
+            TradeIntentSource.COPY_TRADE,
+            TradeIntentSource.MANUAL_BUY,
+            TradeIntentSource.YOLO,
+            TradeIntentSource.TOKEN_LAUNCH,
+            TradeIntentSource.LAUNCH_BUNDLE,
+        }
+        exits = set(TradeIntentSource) - entries
+        self.assertTrue(
+            all(
+                source.economic_action_class == EconomicActionClass.ENTRY
+                for source in entries
+            )
+        )
+        self.assertTrue(
+            all(
+                source.economic_action_class == EconomicActionClass.EXIT
+                for source in exits
+            )
+        )
+
     async def test_startup_orders_recovery_before_warm_and_activation(self) -> None:
         trader = FakeTrader()
         app = HunterApplication(base_config(), trader)
@@ -257,6 +339,170 @@ class RuntimeCompositionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ExecutionError):
             await app.dispatch_intent(buy_intent())
         self.assertTrue(app.runtime_status().kill_switch)
+        await app.shutdown()
+
+    async def test_normal_runtime_allows_entries_and_managed_exits(self) -> None:
+        trader = FakeTrader()
+        app = HunterApplication(base_config(), trader)
+        await app.start(start_detection=False)
+        await app.dispatch_intent(buy_intent(TradeIntentSource.MANUAL_BUY))
+        await app.dispatch_intent(sell_intent())
+        self.assertEqual(len(trader.intents), 2)
+        status = app.runtime_status()
+        self.assertTrue(status.application_ready)
+        self.assertTrue(status.entries_allowed)
+        self.assertTrue(status.defensive_exits_allowed)
+        await app.shutdown()
+
+    async def test_trading_disabled_blocks_every_entry_class(self) -> None:
+        app = HunterApplication(base_config(), FakeTrader())
+        await app.start(start_detection=False)
+        app.disable_trading()
+        entries = {
+            TradeIntentSource.LAUNCH_SNIPE,
+            TradeIntentSource.TRACKED_WALLET_CREATE,
+            TradeIntentSource.TRACKED_WALLET_BUY,
+            TradeIntentSource.COPY_TRADE,
+            TradeIntentSource.MANUAL_BUY,
+            TradeIntentSource.YOLO,
+        }
+        for source in entries:
+            with self.subTest(source=source), self.assertRaises(ExecutionError):
+                app.authorize_economic_action(source, TradeAction.BUY)
+        for source in {
+            TradeIntentSource.TOKEN_LAUNCH,
+            TradeIntentSource.LAUNCH_BUNDLE,
+        }:
+            with self.subTest(source=source), self.assertRaises(ExecutionError):
+                app.authorize_economic_action(source, TradeAction.LAUNCH)
+        status = app.runtime_status()
+        self.assertFalse(status.entries_allowed)
+        self.assertTrue(status.defensive_exits_allowed)
+        await app.shutdown()
+
+    async def test_trading_disabled_allows_every_managed_exit_class(self) -> None:
+        app = HunterApplication(base_config(), FakeTrader())
+        await app.start(start_detection=False)
+        app.disable_trading()
+        for source in {
+            TradeIntentSource.MANUAL_SELL,
+            TradeIntentSource.TAKE_PROFIT,
+            TradeIntentSource.STOP_LOSS,
+            TradeIntentSource.TIMED_EXIT,
+            TradeIntentSource.EMERGENCY_EXIT,
+            TradeIntentSource.WALLET_FLEET_EXIT,
+        }:
+            with self.subTest(source=source):
+                app.authorize_economic_action(
+                    source,
+                    TradeAction.SELL,
+                    managed_exit=True,
+                )
+        await app.shutdown()
+
+    async def test_kill_switch_blocks_entries_but_allows_managed_exits(self) -> None:
+        app = HunterApplication(base_config(), FakeTrader())
+        await app.start(start_detection=False)
+        app.activate_kill_switch()
+        for source in {
+            TradeIntentSource.LAUNCH_SNIPE,
+            TradeIntentSource.TRACKED_WALLET_CREATE,
+            TradeIntentSource.TRACKED_WALLET_BUY,
+            TradeIntentSource.COPY_TRADE,
+            TradeIntentSource.MANUAL_BUY,
+            TradeIntentSource.YOLO,
+        }:
+            with self.subTest(source=source), self.assertRaises(ExecutionError):
+                app.authorize_economic_action(source, TradeAction.BUY)
+        for source in {
+            TradeIntentSource.TOKEN_LAUNCH,
+            TradeIntentSource.LAUNCH_BUNDLE,
+        }:
+            with self.subTest(source=source), self.assertRaises(ExecutionError):
+                app.authorize_economic_action(source, TradeAction.LAUNCH)
+        for source in {
+            TradeIntentSource.MANUAL_SELL,
+            TradeIntentSource.TAKE_PROFIT,
+            TradeIntentSource.STOP_LOSS,
+            TradeIntentSource.TIMED_EXIT,
+            TradeIntentSource.EMERGENCY_EXIT,
+            TradeIntentSource.WALLET_FLEET_EXIT,
+        }:
+            with self.subTest(source=source):
+                app.authorize_economic_action(
+                    source,
+                    TradeAction.SELL,
+                    managed_exit=True,
+                )
+        status = app.runtime_status()
+        self.assertFalse(status.entries_allowed)
+        self.assertTrue(status.defensive_exits_allowed)
+        await app.shutdown()
+
+    async def test_exit_authorization_requires_managed_position(self) -> None:
+        app = HunterApplication(base_config(), FakeTrader())
+        await app.start(start_detection=False)
+        with self.assertRaisesRegex(ExecutionError, "managed position"):
+            app.authorize_economic_action(
+                TradeIntentSource.MANUAL_SELL,
+                TradeAction.SELL,
+            )
+        with self.assertRaisesRegex(ValueError, "entry source"):
+            app.authorize_economic_action(
+                TradeIntentSource.MANUAL_BUY,
+                TradeAction.SELL,
+                managed_exit=True,
+            )
+        await app.shutdown()
+
+    async def test_kill_switch_revalidates_entry_at_final_boundary(self) -> None:
+        trader = PausedBoundaryTrader()
+        app = HunterApplication(base_config(), trader)
+        await app.start(start_detection=False)
+        pending = asyncio.create_task(app.dispatch_intent(buy_intent()))
+        await trader.boundary_reached.wait()
+        app.activate_kill_switch()
+        trader.boundary_release.set()
+        with self.assertRaises(ExecutionError):
+            await pending
+        self.assertEqual(trader.submissions, 0)
+        await app.shutdown()
+
+    async def test_trading_disable_revalidates_entry_at_final_boundary(self) -> None:
+        trader = PausedBoundaryTrader()
+        app = HunterApplication(base_config(), trader)
+        await app.start(start_detection=False)
+        pending = asyncio.create_task(app.dispatch_intent(buy_intent()))
+        await trader.boundary_reached.wait()
+        app.disable_trading()
+        trader.boundary_release.set()
+        with self.assertRaises(ExecutionError):
+            await pending
+        self.assertEqual(trader.submissions, 0)
+        await app.shutdown()
+
+    async def test_stop_loss_remains_authorized_after_kill_switch(self) -> None:
+        trader = PausedBoundaryTrader()
+        app = HunterApplication(base_config(), trader)
+        await app.start(start_detection=False)
+        app.activate_kill_switch()
+        pending = asyncio.create_task(
+            app.dispatch_intent(sell_intent(TradeIntentSource.STOP_LOSS))
+        )
+        await trader.boundary_reached.wait()
+        trader.boundary_release.set()
+        result = await pending
+        self.assertTrue(result.success)
+        self.assertEqual(trader.submissions, 1)
+        await app.shutdown()
+
+    async def test_kill_switch_does_not_automatically_liquidate(self) -> None:
+        trader = FakeTrader()
+        app = HunterApplication(base_config(), trader)
+        await app.start(start_detection=False)
+        app.activate_kill_switch()
+        await asyncio.sleep(0)
+        self.assertEqual(trader.intents, [])
         await app.shutdown()
 
     async def test_successful_intent_uses_single_trader_boundary(self) -> None:

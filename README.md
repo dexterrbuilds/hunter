@@ -143,7 +143,11 @@ opens SQLite, completes restart recovery, warms required execution
 infrastructure, activates monitors and enabled services, and only then permits
 new economic intents. Runtime readiness and trading permission are separate, so
 Hunter can operate as a read-only observer with feeds, telemetry, recovery, and
-status active while transaction submission remains disabled.
+status active while new exposure remains disabled. Managed manual sells,
+take-profit, stop-loss, timed, emergency, and eligible fleet exits remain
+available during a trading halt or kill switch; normal ownership, risk, fee,
+and idempotency checks still apply. The kill switch never liquidates
+automatically.
 
 Tracked-wallet mode is part of this normal lifecycle when enabled; no standalone
 script is required. Token-launch and wallet-fleet orchestration remain disabled

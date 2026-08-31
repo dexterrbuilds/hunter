@@ -70,8 +70,11 @@ class RuntimeStatus:
     """Framework-neutral status consumed by future interfaces."""
 
     application_state: ApplicationState
+    application_ready: bool
     trading_enabled: bool
     kill_switch: bool
+    entries_allowed: bool
+    defensive_exits_allowed: bool
     recovery_complete: bool
     database_ready: bool
     blockhash_ready: bool | None

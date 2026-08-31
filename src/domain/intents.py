@@ -26,6 +26,13 @@ class TradeAction(StrEnum):
     LAUNCH = "launch"
 
 
+class EconomicActionClass(StrEnum):
+    """Whether an intent increases or reduces Hunter-managed exposure."""
+
+    ENTRY = "entry"
+    EXIT = "exit"
+
+
 class TradeIntentSource(StrEnum):
     """Why Hunter is executing; never which transport it should use."""
 
@@ -56,6 +63,55 @@ class TradeIntentSource(StrEnum):
             self.WALLET_FLEET_EXIT: "FLEET_EXIT",
         }
         return aliases.get(self, self.value.upper())
+
+    @property
+    def economic_action_class(self) -> EconomicActionClass:
+        """Return the explicit exposure effect used by runtime authorization."""
+        if self in {
+            self.LAUNCH_SNIPE,
+            self.TRACKED_WALLET_CREATE,
+            self.TRACKED_WALLET_BUY,
+            self.COPY_TRADE,
+            self.MANUAL_BUY,
+            self.YOLO,
+            self.TOKEN_LAUNCH,
+            self.LAUNCH_BUNDLE,
+        }:
+            return EconomicActionClass.ENTRY
+        if self in {
+            self.MANUAL_SELL,
+            self.TAKE_PROFIT,
+            self.STOP_LOSS,
+            self.TIMED_EXIT,
+            self.EMERGENCY_EXIT,
+            self.WALLET_FLEET_EXIT,
+        }:
+            return EconomicActionClass.EXIT
+        raise ValueError(f"unclassified trade intent source: {self.value}")
+
+
+def classify_economic_action(
+    source: TradeIntentSource, action: TradeAction
+) -> EconomicActionClass:
+    """Classify and validate one typed intent without heuristic matching."""
+    classification = source.economic_action_class
+    if classification == EconomicActionClass.EXIT and action != TradeAction.SELL:
+        raise ValueError(f"exit source {source.value} requires a sell action")
+    launch_sources = {
+        TradeIntentSource.TOKEN_LAUNCH,
+        TradeIntentSource.LAUNCH_BUNDLE,
+    }
+    if source in launch_sources and action != TradeAction.LAUNCH:
+        raise ValueError(f"launch source {source.value} requires a launch action")
+    if (
+        classification == EconomicActionClass.ENTRY
+        and source not in launch_sources
+        and action != TradeAction.BUY
+    ):
+        raise ValueError(f"entry source {source.value} requires a buy action")
+    if action == TradeAction.LAUNCH and source not in launch_sources:
+        raise ValueError(f"source {source.value} cannot authorize a token launch")
+    return classification
 
 
 class ExecutionUrgency(StrEnum):

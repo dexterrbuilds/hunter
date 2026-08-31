@@ -29,7 +29,13 @@ from application.runtime_models import (
 )
 from application.runtime_supervisor import RuntimeTaskSupervisor
 from application.wallet_tracking import AsyncWalletEventStore, TrackedWalletService
-from domain.intents import TradeIntent, TradeIntentSource
+from domain.intents import (
+    EconomicActionClass,
+    TradeAction,
+    TradeIntent,
+    TradeIntentSource,
+    classify_economic_action,
+)
 from domain.launch import LaunchExecutionPlan, TokenLaunchRequest
 from execution.errors import ErrorClassification, ExecutionError
 from execution.providers.config import ProviderRole
@@ -133,7 +139,7 @@ class HunterApplication:
         if hasattr(self.trader, "detection_state_observer"):
             self.trader.detection_state_observer = self._detection_state_changed
         if hasattr(self.trader, "runtime_authorizer"):
-            self.trader.runtime_authorizer = self.authorize_source
+            self.trader.runtime_authorizer = self.authorize_economic_action
         composition_started = monotonic_ns()
         self._validate_and_compose()
         self._startup_timings.append(
@@ -201,6 +207,7 @@ class HunterApplication:
             self.features.token_launch_service = launch
             self.features.wallet_fleet_service = fleet
             self.features.wallet_fleet_exit_service = fleet_exit
+            self._wire_orchestration_authorizers(launch, fleet_exit)
         if tracking.enabled:
             if self.trader.platform != Platform.PUMP_FUN:
                 raise ValueError("tracked-wallet runtime currently requires pump_fun")
@@ -245,6 +252,14 @@ class HunterApplication:
             required=True,
         )
         self._transition(ApplicationState.PERSISTENCE_READY)
+
+    def _wire_orchestration_authorizers(
+        self, launch: object | None, fleet_exit: object | None
+    ) -> None:
+        if launch is not None and hasattr(launch, "submission_authorizer"):
+            launch.submission_authorizer = self._authorize_token_launch
+        if fleet_exit is not None and hasattr(fleet_exit, "submission_authorizer"):
+            fleet_exit.submission_authorizer = self.authorize_trade_intent
 
     async def start(self, *, start_detection: bool = True) -> None:
         """Cross the recovery barrier, warm infrastructure, then start services."""
@@ -340,11 +355,25 @@ class HunterApplication:
         return await self.dispatch_intent(intent)
 
     def _authorize(self, intent: TradeIntent) -> None:
-        self.authorize_source(intent.source)
+        self.authorize_trade_intent(intent)
 
-    def authorize_source(self, source: TradeIntentSource) -> None:
-        """Authorize an inherited managed path without provider-side detail."""
-        del source
+    def authorize_trade_intent(self, intent: TradeIntent) -> None:
+        """Authorize a typed intent while retaining managed-exit requirements."""
+        self.authorize_economic_action(
+            intent.source,
+            intent.action,
+            managed_exit=intent.position_id is not None,
+        )
+
+    def authorize_economic_action(
+        self,
+        source: TradeIntentSource,
+        action: TradeAction,
+        *,
+        managed_exit: bool = False,
+    ) -> None:
+        """Gate exposure changes at the final application execution boundary."""
+        classification = classify_economic_action(source, action)
         if not self.recovery_complete:
             raise ExecutionError(
                 ErrorClassification.RISK_LIMIT_EXCEEDED,
@@ -355,16 +384,29 @@ class HunterApplication:
                 ErrorClassification.PROVIDER_UNAVAILABLE,
                 "runtime is not ready for economic execution",
             )
+        if classification == EconomicActionClass.EXIT:
+            if not managed_exit:
+                raise ExecutionError(
+                    ErrorClassification.RISK_LIMIT_EXCEEDED,
+                    "defensive exit requires an existing managed position",
+                )
+            return
         if self.kill_switch:
             raise ExecutionError(
                 ErrorClassification.RISK_LIMIT_EXCEEDED,
-                "runtime kill switch is active",
+                "runtime kill switch blocks new exposure",
             )
         if not self.trading_enabled:
             raise ExecutionError(
                 ErrorClassification.RISK_LIMIT_EXCEEDED,
-                "runtime trading is disabled",
+                "runtime trading is disabled for new exposure",
             )
+
+    def _authorize_token_launch(self) -> None:
+        self.authorize_economic_action(
+            TradeIntentSource.TOKEN_LAUNCH,
+            TradeAction.LAUNCH,
+        )
 
     async def shutdown(self, timeout_seconds: float = 15.0) -> None:
         """Stop producers first, then flush state and close owned resources."""
@@ -436,11 +478,7 @@ class HunterApplication:
         self, request: TokenLaunchRequest, **values: object
     ) -> object:
         """Submit through the composed launch service after runtime gating."""
-        if not self.recovery_complete or not self.trading_enabled or self.kill_switch:
-            raise ExecutionError(
-                ErrorClassification.RISK_LIMIT_EXCEEDED,
-                "runtime does not permit token launch submission",
-            )
+        self._authorize_token_launch()
         service = self.features.token_launch_service
         if service is None:
             raise ValueError("token launch runtime is disabled")
@@ -454,6 +492,11 @@ class HunterApplication:
 
     async def submit_fleet_exit(self, **values: object) -> object:
         """Dispatch an existing fleet exit policy through the composed service."""
+        self.authorize_economic_action(
+            TradeIntentSource.WALLET_FLEET_EXIT,
+            TradeAction.SELL,
+            managed_exit=True,
+        )
         service = self.features.wallet_fleet_exit_service
         if service is None:
             raise ValueError("wallet fleet exit runtime is disabled")
@@ -481,10 +524,19 @@ class HunterApplication:
         if blockhash_cache is not None:
             blockhash_ready = blockhash_cache.current() is not None
         selection = getattr(self.trader.priority_fee_manager, "last_selection", None)
+        application_ready = self.recovery_complete and self.state in {
+            ApplicationState.READY,
+            ApplicationState.DEGRADED,
+        }
         return RuntimeStatus(
             application_state=self.state,
+            application_ready=application_ready,
             trading_enabled=self.trading_enabled,
             kill_switch=self.kill_switch,
+            entries_allowed=(
+                application_ready and self.trading_enabled and not self.kill_switch
+            ),
+            defensive_exits_allowed=application_ready,
             recovery_complete=self.recovery_complete,
             database_ready=self.state
             not in {ApplicationState.CREATED, ApplicationState.FAILED},

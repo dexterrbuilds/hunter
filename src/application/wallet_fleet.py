@@ -225,11 +225,13 @@ class WalletFleetExitService:
         execute_intent: FleetIntentExecutor,
         *,
         bundle_executor: FleetBundleExecutor | None = None,
+        submission_authorizer: Callable[[TradeIntent], None] | None = None,
         maximum_concurrency: int = 4,
     ) -> None:
         self.store = store
         self.execute_intent = execute_intent
         self.bundle_executor = bundle_executor
+        self.submission_authorizer = submission_authorizer
         self.maximum_concurrency = maximum_concurrency
 
     async def execute_exit(
@@ -302,6 +304,8 @@ class WalletFleetExitService:
         if policy == FleetExecutionPolicy.BUNDLE:
             if self.bundle_executor is None:
                 raise ValueError("bundled exit selected without bundle executor")
+            for intent in frozen:
+                self._authorize_submission(intent)
             await self.bundle_executor(frozen)
             for intent in frozen:
                 await asyncio.to_thread(
@@ -334,6 +338,11 @@ class WalletFleetExitService:
 
         await asyncio.gather(*(execute(intent) for intent in frozen))
         return frozen
+
+    def _authorize_submission(self, intent: TradeIntent) -> None:
+        """Retain the runtime defensive-exit gate for direct bundle submission."""
+        if self.submission_authorizer is not None:
+            self.submission_authorizer(intent)
 
     def pending_after_restart(self, plan_id: str) -> list[dict]:
         """Expose pending signatures for inspection; never resubmit here."""

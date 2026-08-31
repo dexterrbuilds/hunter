@@ -1160,7 +1160,7 @@ class UniversalTrader:
             if getattr(self, "yolo_mode", False)
             else TradeIntentSource.LAUNCH_SNIPE
         )
-        self._authorize_runtime_source(source)
+        self._authorize_runtime_source(source, TradeAction.BUY)
         if not hasattr(self, "position_store"):
             return await self.buyer.execute(token_info)
         logical_execution_id = logical_execution_id or f"buy:{token_info.mint}"
@@ -1591,7 +1591,13 @@ class UniversalTrader:
         slippage_override: BasisPoints | None = None,
     ) -> TradeResult:
         """Persist sell lifecycle and inspect ambiguous signatures before retry."""
-        self._authorize_runtime_source(intent_source)
+        mint_key = str(token_info.mint)
+        position_id, managed_exit = self._resolve_managed_exit(mint_key)
+        self._authorize_runtime_source(
+            intent_source,
+            TradeAction.SELL,
+            managed_exit=managed_exit,
+        )
         if not hasattr(self, "active_position_ids"):
             # Offline Milestone 1 verification harnesses construct a minimal
             # coordinator without persistence; preserve their call contract.
@@ -1600,8 +1606,6 @@ class UniversalTrader:
                 token_amount=token_amount,
                 token_price=token_price,
             )
-        mint_key = str(token_info.mint)
-        position_id = self.active_position_ids.get(mint_key)
         pending_execution = None
         if position_id is not None:
             stored = self.position_service.get_position(position_id)
@@ -1732,7 +1736,13 @@ class UniversalTrader:
             )
         return result
 
-    def _authorize_runtime_source(self, source: TradeIntentSource | str) -> None:
+    def _authorize_runtime_source(
+        self,
+        source: TradeIntentSource | str,
+        action: TradeAction,
+        *,
+        managed_exit: bool = False,
+    ) -> None:
         authorizer = getattr(self, "runtime_authorizer", None)
         if authorizer is None:
             return
@@ -1741,7 +1751,14 @@ class UniversalTrader:
             if isinstance(source, TradeIntentSource)
             else TradeIntentSource(str(source))
         )
-        authorizer(normalized)
+        authorizer(normalized, action, managed_exit=managed_exit)
+
+    def _resolve_managed_exit(self, mint_key: str) -> tuple[str | None, bool]:
+        """Resolve production ownership while preserving offline harnesses."""
+        if not hasattr(self, "active_position_ids"):
+            return None, True
+        position_id = self.active_position_ids.get(mint_key)
+        return position_id, position_id is not None
 
     def _get_pool_address(self, token_info: TokenInfo) -> Pubkey:
         """Get the pool/curve address for price monitoring using platform-agnostic method."""

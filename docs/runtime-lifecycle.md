@@ -38,9 +38,17 @@ event producers activated. Runtime-generated intents require:
 
 - completed recovery;
 - `READY`, or explicitly permitted `DEGRADED`, application state;
-- enabled runtime trading;
-- a kill switch that permits the action;
+- enabled runtime trading and an inactive kill switch for new exposure;
+- an existing managed position identity for a defensive exit;
 - approval from the existing RiskService for the exact plan and fees.
+
+Trading disable and kill-switch activation halt new exposure, not recovery or
+position defense. Managed manual sells, TP, SL, timed exits, emergency exits,
+and eligible fleet exits remain authorized while normal ownership, risk, fee,
+idempotency, signer, and venue checks continue. Source/action classification is
+typed and exhaustive; an entry source cannot be relabeled as a sell bypass.
+Authorization is repeated at the managed execution boundary to close the race
+between intent creation and submission.
 
 ## Detection readiness
 
@@ -67,7 +75,7 @@ component ownership, preventing duplicate worker lifecycles.
 
 Shutdown is idempotent and bounded:
 
-1. Disable new economic intents.
+1. Disable new exposure while retaining already-submitted recovery state.
 2. Enter `SHUTTING_DOWN`.
 3. Cancel and join supervised detection.
 4. Stop tracked-wallet producers and drain decoder workers.

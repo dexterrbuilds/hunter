@@ -79,9 +79,26 @@ normalized observation model more efficiently.
 
 Readiness and trading permission are separate. Hunter can recover, warm
 providers, run listeners, collect telemetry, and report status while trading is
-disabled. The runtime gate and RiskService both reject new entries. The kill
-switch follows the existing RiskService semantics and blocks all economic
-submission, including exits; operators should not use it as an exit command.
+disabled. The runtime gate and RiskService reject every exposure-increasing
+entry while preserving managed defensive exits. Activating the kill switch has
+the same exposure-halt semantics: it blocks buys, launch snipes, tracked-wallet
+entries, YOLO entries, token launches, launch bundles, and additional fleet
+exposure, but does not block an owned-position manual sell, TP, SL, timed exit,
+emergency exit, or eligible fleet exit.
+
+An exit source is not an unrestricted sell bypass. It must carry an existing
+managed position identity and still passes ownership, signer, risk, fee,
+idempotency, venue, and execution checks. The runtime revalidates immediately
+before managed submission, so an entry prepared before a halt cannot cross the
+boundary afterward. Prepared-but-unsent launch components are revalidated too.
+Already-submitted transactions remain under confirmation/recovery; Hunter does
+not attempt cancellation or create a replacement merely because controls
+changed.
+
+The kill switch never liquidates automatically and does not override
+`marry_mode`. An emergency sell remains a separate explicit managed action.
+`RuntimeStatus` reports application readiness, the trading and kill-switch
+states, whether entries are allowed, and whether defensive exits are available.
 
 No broad simulator was added. Offline fakes exercise the real composition root;
 live execution remains governed by existing explicit benchmark/trading config.

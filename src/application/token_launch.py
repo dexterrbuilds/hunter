@@ -301,6 +301,7 @@ class TokenLaunchService:
         store: LaunchStore,
         component_submitter: ComponentSubmitter,
         bundle_submitter: JitoBundleSubmitter | None = None,
+        submission_authorizer: Callable[[], None] | None = None,
         maximum_prepare_concurrency: int = 4,
         maximum_blockhash_age_ms: int = 30_000,
     ) -> None:
@@ -313,6 +314,7 @@ class TokenLaunchService:
         self.store = store
         self.submit_component = component_submitter
         self.bundle_submitter = bundle_submitter
+        self.submission_authorizer = submission_authorizer
         self.maximum_prepare_concurrency = maximum_prepare_concurrency
         self.maximum_blockhash_age_ms = maximum_blockhash_age_ms
 
@@ -530,6 +532,7 @@ class TokenLaunchService:
                 ErrorClassification.CONFIGURATION_ERROR,
                 "bundle execution selected without a bundle-capable provider",
             )
+        self._authorize_submission()
         result = await self.bundle_submitter.submit_bundle(
             plan_id=plan.plan_id,
             transactions=tuple(item.transaction for item in prepared),
@@ -572,6 +575,7 @@ class TokenLaunchService:
         prepared: tuple[PreparedLaunchComponent, ...],
     ) -> LaunchSubmission:
         if plan.execution_policy == FleetExecutionPolicy.PARALLEL_FAST:
+            self._authorize_submission()
             results = await asyncio.gather(
                 *(
                     self.submit_component(item.transaction, item.context)
@@ -581,6 +585,7 @@ class TokenLaunchService:
         else:
             results = []
             for item in prepared:
+                self._authorize_submission()
                 results.append(
                     await self.submit_component(item.transaction, item.context)
                 )
@@ -617,6 +622,11 @@ class TokenLaunchService:
             tuple(item.transaction.signature for item in prepared),
             submission_results=tuple(results),
         )
+
+    def _authorize_submission(self) -> None:
+        """Revalidate prepared-but-unsent launch exposure immediately before send."""
+        if self.submission_authorizer is not None:
+            self.submission_authorizer()
 
 
 class TokenLaunchRecoveryService:

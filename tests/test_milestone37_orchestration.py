@@ -796,7 +796,7 @@ class LaunchServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.store.close()
 
-    def _service(self, balances=None):
+    def _service(self, balances=None, submission_authorizer=None):
         async def submit(transaction, context):
             return SubmissionResult(
                 transaction.signature,
@@ -815,6 +815,7 @@ class LaunchServiceTests(unittest.IsolatedAsyncioTestCase):
             store=self.store,
             component_submitter=submit,
             bundle_submitter=self.bundle,
+            submission_authorizer=submission_authorizer,
         )
 
     async def test_bundle_plan_is_persisted_before_acknowledgement(self):
@@ -895,6 +896,23 @@ class LaunchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             stored["error_classification"], ErrorClassification.UNKNOWN.value
         )
+
+    async def test_runtime_halt_revalidates_prepared_launch_before_submission(self):
+        def reject_new_exposure():
+            raise ExecutionError(
+                ErrorClassification.RISK_LIMIT_EXCEEDED,
+                "runtime kill switch blocks new exposure",
+            )
+
+        with self.assertRaisesRegex(ExecutionError, "kill switch"):
+            await self._service(submission_authorizer=reject_new_exposure).execute(
+                launch_request(),
+                estimated_cost=LaunchCostEstimate(100, 1_000, 10_000, 20_000),
+                execution_variant="jito_tipped",
+            )
+        self.assertEqual(self.transport.calls, [])
+        stored = self.store.get_launch_plan("launch:launch-one")
+        self.assertEqual(stored["state"], LaunchState.RECONCILIATION_REQUIRED.value)
 
     async def test_concrete_preparer_uses_create_builder_and_buy_factory(self):
         idl = IDLParser(str(ROOT / "idl" / "pump_fun_idl.json"))

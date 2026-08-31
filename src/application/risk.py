@@ -77,13 +77,12 @@ class RiskService:
         limits = self.limits
         if not limits.enforce:
             return
-        if limits.emergency_kill_switch:
-            raise _risk_error("emergency kill switch is active")
-        if not limits.trading_enabled:
-            raise _risk_error("trading is disabled")
-
         quote = plan.quote_mint
         if plan.side == ExecutionSide.BUY:
+            if limits.emergency_kill_switch:
+                raise _risk_error("emergency kill switch is active")
+            if not limits.trading_enabled:
+                raise _risk_error("trading is disabled")
             self._guard_optional_max(
                 plan.input_raw,
                 limits.maximum_buy_raw_by_quote.get(quote),

@@ -18,7 +18,12 @@ from application.risk import (  # noqa: E402
     RiskService,
 )
 from core.pubkeys import WSOL_MINT  # noqa: E402
-from domain.amounts import BasisPoints, Lamports, QuoteAmountRaw  # noqa: E402
+from domain.amounts import (  # noqa: E402
+    BasisPoints,
+    Lamports,
+    QuoteAmountRaw,
+    TokenAmountRaw,
+)
 from domain.lifecycle import ExecutionState, is_retryable  # noqa: E402
 from domain.quotes import (  # noqa: E402
     CurveState,
@@ -26,6 +31,7 @@ from domain.quotes import (  # noqa: E402
     ExecutionResult,
     FeeRates,
     quote_buy,
+    quote_sell,
 )
 from execution.confirmation import TransactionObservation  # noqa: E402
 from execution.coordinator import (  # noqa: E402
@@ -58,6 +64,17 @@ def plan():
         slippage=BasisPoints(100),
     )
     return ExecutionPlan.for_buy(quote, "logical")
+
+
+def sell_plan():
+    state = plan().quote.reserve_state
+    quote = quote_sell(
+        tokens=TokenAmountRaw(100_000, TOKEN, 6),
+        curve=state,
+        fee_rates=FeeRates(BasisPoints(100), BasisPoints(50)),
+        slippage=BasisPoints(100),
+    )
+    return ExecutionPlan.for_sell(quote, "logical-sell")
 
 
 def risk_context(priority=10, base=5000, rent=0):
@@ -119,6 +136,19 @@ class RiskTests(unittest.TestCase):
         service = RiskService(RiskLimits(enforce=True, emergency_kill_switch=True))
         with self.assertRaisesRegex(ExecutionError, "kill switch"):
             service.assess(plan(), risk_context())
+
+    def test_global_halt_flags_allow_sell_but_retain_fee_guards(self):
+        service = RiskService(
+            RiskLimits(
+                enforce=True,
+                trading_enabled=False,
+                emergency_kill_switch=True,
+                maximum_priority_fee_lamports=10,
+            )
+        )
+        service.assess(sell_plan(), risk_context(priority=10))
+        with self.assertRaisesRegex(ExecutionError, "priority fee"):
+            service.assess(sell_plan(), risk_context(priority=11))
 
     def test_maximum_buy_amount(self):
         service = RiskService(
