@@ -71,6 +71,9 @@ protocol path.
 | Telemetry | Detection-to-land timing, provider attempts, blockhash age, fee settings, slots, confirmation progression |
 | Benchmarking | Offline replay, passive multi-detector observation, read-only transport probes, and guarded opt-in economic trials |
 | Maximum-performance profile | Regional multi-feed aggregation, exactly-once mint claiming, background execution caches, sender warm-up, readiness/degraded state, and capability-safe routing |
+| Universal trade intents | Common trigger-neutral path for launch, tracked-wallet, manual, YOLO, managed exit, emergency, and fleet actions |
+| Tracked wallets | Independent Pump.fun CREATE snipes and BUY copies, bounded decoding, durable duplicate claims, explicit sizing |
+| Launch/fleet foundation | Pump.fun `create_v2`, ordered creator/participant buy plans, Jito bundle transport, fleet accounting and coordinated exits; disabled by default |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
@@ -96,9 +99,10 @@ Alternative delivery is opt-in:
   independent read, blockhash, submit, confirm, and WebSocket roles.
 - **Helius Sender:** optimized submission using its documented transaction
   endpoint and a separately guarded tipped variant.
-- **Jito:** normal single-transaction relay, a distinct Jito-tipped variant, or
-  the documented single-transaction `bundleOnly` mode. Hunter does not construct
-  multi-transaction bundles today.
+- **Jito:** normal single-transaction relay, a distinct Jito-tipped variant, the
+  documented single-transaction `bundleOnly` mode, and an isolated ordered
+  multi-transaction bundle adapter for launch/fleet orchestration. Bundle plans
+  are separate economic components with separate signatures.
 
 Compatible providers receive the exact same signed wire bytes and signature in
 a race or hedge. A tip changes the message, so a tipped transaction is modeled
@@ -106,6 +110,30 @@ as a separate execution variant and signed once for that variant.
 
 See [Execution providers](docs/execution-providers.md) and
 [Landing metrics](docs/landing-metrics.md) for the precise semantics.
+
+### Universal execution, tracked wallets, and launch fleets
+
+Transaction speed no longer depends on why Hunter is trading. Launch snipes,
+manual actions, YOLO continuation, tracked-wallet events, TP/SL/time/emergency
+exits, and fleet exits carry a `TradeIntent` into the same exact quote, risk,
+build, signing, routing, and confirmation boundaries. Source and urgency are
+telemetry—not permission to bypass fee or exposure caps.
+
+Tracked public wallets have two independent Pump.fun triggers: CREATE can snipe
+immediately, while BUY can copy a successfully decoded purchase. The safe
+default ignores a later copy when Hunter already has the position. Fixed and
+proportional sizing use raw integers and fail closed when exact source amount or
+quote denomination is unavailable.
+
+The disabled token-launch foundation builds IDL-verified `create_v2` and
+`extend_account` instructions, then plans creator and participant `buy_v2`
+transactions through the existing buy factory. Current packet size makes create
+and creator buy separate transactions. A Jito bundle can restore ordered atomic
+delivery within its current five-transaction capacity; non-bundle modes are
+explicitly partial-landing risks. See
+[Universal fast execution](docs/universal-fast-execution.md),
+[Tracked wallets](docs/wallet-tracking.md), and
+[Token launch and wallet fleets](docs/token-launch-and-wallet-fleet.md).
 
 For the opt-in Amsterdam-oriented infrastructure profile, see
 [Maximum-performance deployment](docs/max-performance-deployment.md). The safe
@@ -427,10 +455,12 @@ To keep the project honest, these are not current features:
 
 - Telegram control or notifications
 - Web UI, public API, or interactive CLI trading
-- Copy trading and wallet mirroring
+- A production-startup or user-interface composition for tracked-wallet and
+  launch/fleet services (the tested services and disabled config foundation now
+  exist)
 - Automatic token-selection strategies beyond the existing filters
 - Production-proven provider ranking
-- Jito multi-transaction bundle construction
+- Production-proven multi-wallet launch/fleet operation
 - Hardware or remote wallet signing
 - Automatic FX conversion of SOL fees into SPL quote PnL
 
@@ -445,6 +475,8 @@ To keep the project honest, these are not current features:
 - Complete integer/raw-unit migration for remaining LetsBonk and extreme-fast
   monetary paths.
 - Strengthen interrupted-buy recovery and portfolio loss/drawdown controls.
+- Compose tracked-wallet monitoring and launch/fleet services behind an explicit
+  operator interface only after controlled live validation.
 
 ### Later
 
@@ -454,8 +486,8 @@ To keep the project honest, these are not current features:
   persisted positions—not chat state.
 - Additional interfaces such as a local CLI, web dashboard, or private API that
   call the same trading engine.
-- Copy trading and wallet monitoring only after execution idempotency, risk, and
-  reconciliation have been proven under real operating conditions.
+- Expand tracked-wallet venue coverage and policy controls only after execution
+  idempotency, risk, and reconciliation have been proven under real conditions.
 
 No provider or delivery method will be labeled “fastest” without Hunter's own
 measurements from the intended deployment environment.
@@ -483,6 +515,9 @@ measurements from the intended deployment environment.
 | [Landing metrics](docs/landing-metrics.md) | Slot definitions, same-slot reporting, detection ambiguity |
 | [Benchmarking](docs/benchmarking.md) | Offline replay, reports, and explicit live opt-in rules |
 | [Controlled live benchmark](docs/live-benchmark.md) | Passive detection, transport probes, guarded tiny trades, exports, and interpretation |
+| [Universal fast execution](docs/universal-fast-execution.md) | Trigger-neutral intents, shared execution, urgency, and zero-read rules |
+| [Tracked wallets](docs/wallet-tracking.md) | Independent CREATE/BUY triggers, decoding, sizing, duplicates, and recovery |
+| [Token launch and wallet fleets](docs/token-launch-and-wallet-fleet.md) | Pump.fun launch plans, bundles, risks, fleet accounting, exits, and recovery |
 | [Known risks](docs/known-risks.md) | Unresolved funds, accounting, recovery, protocol, and throughput risks |
 | [Upstream provenance](UPSTREAM.md) | Imported source snapshot, derivative-work notice, IDL checksums |
 

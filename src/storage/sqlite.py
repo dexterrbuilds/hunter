@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 from solders.pubkey import Pubkey
 
@@ -20,9 +21,14 @@ from domain.lifecycle import (
     require_transition,
 )
 from execution.errors import ErrorClassification
-from execution.telemetry import ExecutionTelemetry
 
-SCHEMA_VERSION = 3
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from domain.wallet_tracking import WalletActivity
+    from execution.telemetry import ExecutionTelemetry
+
+SCHEMA_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -118,6 +124,12 @@ class SQLitePositionStore:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, _now()),
+                )
+            if SCHEMA_VERSION not in applied:
+                self._migration_4(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, _now()),
                 )
 
     @staticmethod
@@ -250,6 +262,104 @@ class SQLitePositionStore:
             "CREATE INDEX IF NOT EXISTS provider_submission_provider_idx "
             "ON provider_submission_telemetry(provider_id, endpoint_id)"
         )
+
+    @staticmethod
+    def _migration_4(connection: sqlite3.Connection) -> None:
+        """Add trigger and fleet orchestration state without signer secrets."""
+        statements = (
+            """CREATE TABLE IF NOT EXISTS tracked_wallet_events (
+                event_id TEXT PRIMARY KEY,
+                wallet TEXT NOT NULL,
+                wallet_label TEXT,
+                activity_type TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                source_signature TEXT NOT NULL,
+                source_slot INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                state TEXT NOT NULL,
+                intent_id TEXT,
+                reason TEXT,
+                observed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS launch_plans (
+                plan_id TEXT PRIMARY KEY,
+                launch_id TEXT NOT NULL UNIQUE,
+                mint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                execution_policy TEXT NOT NULL,
+                bundle_id TEXT,
+                provider_id TEXT,
+                blockhash TEXT,
+                last_valid_block_height INTEGER,
+                exit_policy_json TEXT NOT NULL,
+                error_classification TEXT,
+                recovery_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS launch_components (
+                plan_id TEXT NOT NULL REFERENCES launch_plans(plan_id),
+                component_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                wallet_id TEXT NOT NULL,
+                wallet_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                state TEXT NOT NULL,
+                logical_execution_id TEXT NOT NULL UNIQUE,
+                signature TEXT UNIQUE,
+                blockhash TEXT,
+                quote_amount_raw TEXT,
+                token_quantity_raw TEXT,
+                quote_cost_basis_raw TEXT,
+                known_cost_lamports TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(plan_id, component_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS fleet_positions (
+                fleet_position_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL REFERENCES launch_plans(plan_id),
+                launch_id TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                quote_mint TEXT NOT NULL,
+                wallet_id TEXT NOT NULL,
+                wallet_role TEXT NOT NULL,
+                token_decimals INTEGER NOT NULL,
+                quote_decimals INTEGER NOT NULL,
+                buy_signature TEXT NOT NULL UNIQUE,
+                acquired_quantity_raw TEXT NOT NULL,
+                remaining_quantity_raw TEXT NOT NULL,
+                quote_cost_basis_raw TEXT NOT NULL,
+                quote_proceeds_raw TEXT NOT NULL,
+                realized_pnl_raw TEXT NOT NULL,
+                known_cost_lamports TEXT,
+                status TEXT NOT NULL,
+                marry_mode INTEGER NOT NULL,
+                scheduled_exit_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(plan_id, wallet_id, mint)
+            )""",
+            """CREATE TABLE IF NOT EXISTS fleet_exit_executions (
+                logical_execution_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL REFERENCES launch_plans(plan_id),
+                fleet_position_id TEXT NOT NULL REFERENCES fleet_positions(fleet_position_id),
+                trigger_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                signature TEXT UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS tracked_wallet_mint_idx "
+            "ON tracked_wallet_events(wallet, mint)",
+            "CREATE INDEX IF NOT EXISTS launch_plans_state_idx ON launch_plans(state)",
+            "CREATE INDEX IF NOT EXISTS fleet_positions_plan_idx "
+            "ON fleet_positions(plan_id, status)",
+        )
+        for statement in statements:
+            connection.execute(statement)
 
     @property
     def schema_version(self) -> int:
@@ -660,6 +770,504 @@ class SQLitePositionStore:
                 "SELECT payload_json FROM provider_submission_telemetry ORDER BY id"
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def claim_wallet_event(
+        self, event: WalletActivity, label: str | None = None
+    ) -> bool:
+        """Persist an activity claim before creating an economic intent."""
+        now = _now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO tracked_wallet_events(
+                    event_id, wallet, wallet_label, activity_type, mint,
+                    source_signature, source_slot, source, state, observed_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'observed', ?, ?, ?)""",
+                (
+                    event.event_id,
+                    str(event.wallet),
+                    label,
+                    event.activity_type.value,
+                    str(event.mint),
+                    event.signature,
+                    event.slot,
+                    event.source,
+                    event.observed_at.isoformat(),
+                    now,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def complete_wallet_event(
+        self,
+        event_id: str,
+        *,
+        state: str,
+        intent_id: str | None,
+        reason: str | None,
+    ) -> None:
+        """Update a claimed event with safe lifecycle information."""
+        allowed = {"ignored", "intent_created", "executed", "failed"}
+        if state not in allowed:
+            raise ValueError(  # noqa: TRY003
+                f"unsupported wallet event state: {state}"
+            )
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE tracked_wallet_events
+                   SET state = ?, intent_id = COALESCE(?, intent_id), reason = ?,
+                       updated_at = ? WHERE event_id = ?""",
+                (state, intent_id, reason, _now(), event_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(f"unknown wallet event: {event_id}")  # noqa: TRY003
+
+    def list_wallet_events(self, *, state: str | None = None) -> list[dict[str, Any]]:
+        """Return credential-free activity for recovery and reporting."""
+        with self._lock:
+            if state is None:
+                rows = self._connection.execute(
+                    "SELECT * FROM tracked_wallet_events ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM tracked_wallet_events WHERE state = ? "
+                    "ORDER BY created_at",
+                    (state,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_launch_plan(  # noqa: PLR0913
+        self,
+        *,
+        plan_id: str,
+        launch_id: str,
+        mint: str,
+        state: str,
+        execution_policy: str,
+        exit_policy: dict[str, Any],
+    ) -> bool:
+        """Claim one launch ID before any transaction is signed."""
+        now = _now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO launch_plans(
+                    plan_id, launch_id, mint, state, execution_policy,
+                    exit_policy_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan_id,
+                    launch_id,
+                    mint,
+                    state,
+                    execution_policy,
+                    json.dumps(exit_policy, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def get_launch_plan(self, plan_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM launch_plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["exit_policy"] = json.loads(result.pop("exit_policy_json"))
+        return result
+
+    def update_launch_plan(  # noqa: PLR0913
+        self,
+        plan_id: str,
+        *,
+        state: str,
+        bundle_id: str | None = None,
+        provider_id: str | None = None,
+        blockhash: str | None = None,
+        last_valid_block_height: int | None = None,
+        error_classification: str | None = None,
+        recovery_reason: str | None = None,
+    ) -> None:
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE launch_plans SET state = ?,
+                    bundle_id = COALESCE(?, bundle_id),
+                    provider_id = COALESCE(?, provider_id),
+                    blockhash = COALESCE(?, blockhash),
+                    last_valid_block_height = COALESCE(?, last_valid_block_height),
+                    error_classification = ?, recovery_reason = ?, updated_at = ?
+                    WHERE plan_id = ?""",
+                (
+                    state,
+                    bundle_id,
+                    provider_id,
+                    blockhash,
+                    last_valid_block_height,
+                    error_classification,
+                    recovery_reason,
+                    _now(),
+                    plan_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(f"unknown launch plan: {plan_id}")  # noqa: TRY003
+
+    def save_launch_component(  # noqa: PLR0913
+        self,
+        *,
+        plan_id: str,
+        component_id: str,
+        sequence_index: int,
+        wallet_id: str,
+        wallet_role: str,
+        action: str,
+        state: str,
+        logical_execution_id: str,
+        signature: str | None = None,
+        blockhash: str | None = None,
+        quote_amount_raw: int | None = None,
+        token_quantity_raw: int | None = None,
+        quote_cost_basis_raw: int | None = None,
+        known_cost_lamports: int | None = None,
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO launch_components(
+                    plan_id, component_id, sequence_index, wallet_id, wallet_role,
+                    action, state, logical_execution_id, signature, blockhash,
+                    quote_amount_raw, token_quantity_raw, quote_cost_basis_raw,
+                    known_cost_lamports, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id, component_id) DO UPDATE SET
+                    state=excluded.state,
+                    signature=COALESCE(excluded.signature, launch_components.signature),
+                    blockhash=COALESCE(excluded.blockhash, launch_components.blockhash),
+                    token_quantity_raw=COALESCE(
+                        excluded.token_quantity_raw,
+                        launch_components.token_quantity_raw
+                    ),
+                    quote_cost_basis_raw=COALESCE(
+                        excluded.quote_cost_basis_raw,
+                        launch_components.quote_cost_basis_raw
+                    ),
+                    known_cost_lamports=COALESCE(
+                        excluded.known_cost_lamports,
+                        launch_components.known_cost_lamports
+                    ),
+                    updated_at=excluded.updated_at""",
+                (
+                    plan_id,
+                    component_id,
+                    sequence_index,
+                    wallet_id,
+                    wallet_role,
+                    action,
+                    state,
+                    logical_execution_id,
+                    signature,
+                    blockhash,
+                    _encode_int(quote_amount_raw),
+                    _encode_int(token_quantity_raw),
+                    _encode_int(quote_cost_basis_raw),
+                    _encode_int(known_cost_lamports),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_launch_components(self, plan_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM launch_components WHERE plan_id = ? "
+                "ORDER BY sequence_index",
+                (plan_id,),
+            ).fetchall()
+        result = [dict(row) for row in rows]
+        for item in result:
+            for key in (
+                "quote_amount_raw",
+                "token_quantity_raw",
+                "quote_cost_basis_raw",
+                "known_cost_lamports",
+            ):
+                item[key] = _decode_int(item[key])
+        return result
+
+    def update_launch_component_state(
+        self, plan_id: str, component_id: str, state: str
+    ) -> None:
+        """Advance one persisted component without replacing its identity."""
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE launch_components SET state = ?, updated_at = ?
+                   WHERE plan_id = ? AND component_id = ?""",
+                (state, _now(), plan_id, component_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(  # noqa: TRY003
+                f"unknown launch component: {plan_id}/{component_id}"
+            )
+
+    def list_recoverable_launch_plans(self) -> list[dict[str, Any]]:
+        terminal = ("closed", "failed")
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT plan_id FROM launch_plans WHERE state NOT IN (?, ?) "
+                "ORDER BY created_at",
+                terminal,
+            ).fetchall()
+        return [self.get_launch_plan(row[0]) for row in rows]  # type: ignore[misc]
+
+    def save_fleet_position(self, values: dict[str, Any]) -> None:
+        """Persist launch inventory without signer credentials."""
+        now = _now()
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO fleet_positions(
+                    fleet_position_id, plan_id, launch_id, mint, quote_mint,
+                    wallet_id, wallet_role, token_decimals, quote_decimals,
+                    buy_signature, acquired_quantity_raw, remaining_quantity_raw,
+                    quote_cost_basis_raw, quote_proceeds_raw, realized_pnl_raw,
+                    known_cost_lamports, status, marry_mode, scheduled_exit_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fleet_position_id) DO UPDATE SET
+                    remaining_quantity_raw=excluded.remaining_quantity_raw,
+                    quote_cost_basis_raw=excluded.quote_cost_basis_raw,
+                    quote_proceeds_raw=excluded.quote_proceeds_raw,
+                    realized_pnl_raw=excluded.realized_pnl_raw,
+                    known_cost_lamports=excluded.known_cost_lamports,
+                    status=excluded.status,
+                    scheduled_exit_at=excluded.scheduled_exit_at,
+                    updated_at=excluded.updated_at""",
+                (
+                    values["fleet_position_id"],
+                    values["plan_id"],
+                    values["launch_id"],
+                    values["mint"],
+                    values["quote_mint"],
+                    values["wallet_id"],
+                    values["wallet_role"],
+                    values["token_decimals"],
+                    values["quote_decimals"],
+                    values["buy_signature"],
+                    _encode_int(values["acquired_quantity_raw"]),
+                    _encode_int(values["remaining_quantity_raw"]),
+                    _encode_int(values["quote_cost_basis_raw"]),
+                    _encode_int(values.get("quote_proceeds_raw", 0)),
+                    _encode_int(values.get("realized_pnl_raw", 0)),
+                    _encode_int(values.get("known_cost_lamports")),
+                    values["status"],
+                    int(values.get("marry_mode", False)),
+                    values.get("scheduled_exit_at"),
+                    values.get("created_at", now),
+                    now,
+                ),
+            )
+
+    def list_fleet_positions(
+        self, plan_id: str, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if status is None:
+                rows = self._connection.execute(
+                    "SELECT * FROM fleet_positions WHERE plan_id = ? "
+                    "ORDER BY wallet_id",
+                    (plan_id,),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM fleet_positions WHERE plan_id = ? AND status = ? "
+                    "ORDER BY wallet_id",
+                    (plan_id, status),
+                ).fetchall()
+        result = [dict(row) for row in rows]
+        for item in result:
+            for key in (
+                "acquired_quantity_raw",
+                "remaining_quantity_raw",
+                "quote_cost_basis_raw",
+                "quote_proceeds_raw",
+                "realized_pnl_raw",
+                "known_cost_lamports",
+            ):
+                item[key] = _decode_int(item[key])
+            item["marry_mode"] = bool(item["marry_mode"])
+        return result
+
+    def claim_fleet_exit(
+        self,
+        *,
+        logical_execution_id: str,
+        plan_id: str,
+        fleet_position_id: str,
+        trigger_type: str,
+    ) -> bool:
+        now = _now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO fleet_exit_executions(
+                    logical_execution_id, plan_id, fleet_position_id,
+                    trigger_type, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'planned', ?, ?)""",
+                (
+                    logical_execution_id,
+                    plan_id,
+                    fleet_position_id,
+                    trigger_type,
+                    now,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def update_fleet_exit(
+        self,
+        logical_execution_id: str,
+        *,
+        state: str,
+        signature: str | None = None,
+    ) -> None:
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE fleet_exit_executions SET state = ?,
+                    signature = COALESCE(?, signature), updated_at = ?
+                    WHERE logical_execution_id = ?""",
+                (state, signature, _now(), logical_execution_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(  # noqa: TRY003
+                f"unknown fleet exit: {logical_execution_id}"
+            )
+
+    def list_pending_fleet_exits(self, plan_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM fleet_exit_executions
+                   WHERE plan_id = ? AND state NOT IN ('landed', 'failed')
+                   ORDER BY created_at""",
+                (plan_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def apply_fleet_sell(
+        self,
+        logical_execution_id: str,
+        *,
+        signature: str,
+        sold_quantity_raw: int,
+        quote_proceeds_raw: int,
+        known_exit_cost_lamports: int | None,
+    ) -> dict[str, Any]:
+        """Apply authoritative fleet sell effects and average cost atomically."""
+        if sold_quantity_raw <= 0 or quote_proceeds_raw < 0:
+            raise ValueError(  # noqa: TRY003
+                "fleet sell effects must be non-negative and non-zero"
+            )
+        with self.transaction() as connection:
+            execution = connection.execute(
+                "SELECT * FROM fleet_exit_executions WHERE logical_execution_id = ?",
+                (logical_execution_id,),
+            ).fetchone()
+            if execution is None:
+                raise KeyError(  # noqa: TRY003
+                    f"unknown fleet exit: {logical_execution_id}"
+                )
+            if execution["state"] == "landed":
+                if execution["signature"] != signature:
+                    raise ValueError(  # noqa: TRY003
+                        "landed fleet exit signature cannot be replaced"
+                    )
+                position_id = execution["fleet_position_id"]
+                return self._fleet_position_dict(connection, position_id)
+            position = connection.execute(
+                "SELECT * FROM fleet_positions WHERE fleet_position_id = ?",
+                (execution["fleet_position_id"],),
+            ).fetchone()
+            if position is None:
+                raise KeyError(  # noqa: TRY003
+                    f"unknown fleet position: {execution['fleet_position_id']}"
+                )
+            remaining = _decode_int(position["remaining_quantity_raw"])
+            cost_basis = _decode_int(position["quote_cost_basis_raw"])
+            if sold_quantity_raw > remaining:
+                raise ValueError(  # noqa: TRY003
+                    "fleet sell exceeds remaining inventory"
+                )
+            allocated_cost = (
+                cost_basis
+                if sold_quantity_raw == remaining
+                else cost_basis * sold_quantity_raw // remaining
+            )
+            new_remaining = remaining - sold_quantity_raw
+            new_cost_basis = cost_basis - allocated_cost
+            cumulative_proceeds = (
+                _decode_int(position["quote_proceeds_raw"]) + quote_proceeds_raw
+            )
+            realized = (
+                _decode_int(position["realized_pnl_raw"])
+                + quote_proceeds_raw
+                - allocated_cost
+            )
+            previous_costs = _decode_int(position["known_cost_lamports"])
+            total_costs = (
+                previous_costs + known_exit_cost_lamports
+                if previous_costs is not None and known_exit_cost_lamports is not None
+                else None
+            )
+            now = _now()
+            connection.execute(
+                """UPDATE fleet_positions SET remaining_quantity_raw = ?,
+                    quote_cost_basis_raw = ?, quote_proceeds_raw = ?,
+                    realized_pnl_raw = ?, known_cost_lamports = ?, status = ?,
+                    updated_at = ? WHERE fleet_position_id = ?""",
+                (
+                    _encode_int(new_remaining),
+                    _encode_int(new_cost_basis),
+                    _encode_int(cumulative_proceeds),
+                    _encode_int(realized),
+                    _encode_int(total_costs),
+                    "closed" if new_remaining == 0 else "active",
+                    now,
+                    execution["fleet_position_id"],
+                ),
+            )
+            connection.execute(
+                """UPDATE fleet_exit_executions SET state = 'landed',
+                    signature = ?, updated_at = ? WHERE logical_execution_id = ?""",
+                (signature, now, logical_execution_id),
+            )
+            return self._fleet_position_dict(connection, execution["fleet_position_id"])
+
+    @staticmethod
+    def _fleet_position_dict(
+        connection: sqlite3.Connection, fleet_position_id: str
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM fleet_positions WHERE fleet_position_id = ?",
+            (fleet_position_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(  # noqa: TRY003
+                f"unknown fleet position: {fleet_position_id}"
+            )
+        result = dict(row)
+        for key in (
+            "acquired_quantity_raw",
+            "remaining_quantity_raw",
+            "quote_cost_basis_raw",
+            "quote_proceeds_raw",
+            "realized_pnl_raw",
+            "known_cost_lamports",
+        ):
+            result[key] = _decode_int(result[key])
+        result["marry_mode"] = bool(result["marry_mode"])
+        return result
 
     def set_setting(self, key: str, value: Any) -> None:
         with self._lock:

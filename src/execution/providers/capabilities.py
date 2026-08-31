@@ -16,6 +16,7 @@ class TransportCapability(StrEnum):
     DIRECT_LEADER = "direct_leader"
     TIPPED_VARIANT = "tipped_variant"
     SAME_SIGNATURE_COMPATIBLE = "same_signature_compatible"
+    MULTI_TRANSACTION_BUNDLE = "multi_transaction_bundle"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class ProviderCapabilities:
     requires_priority_fee: bool = False
     execution_variants: frozenset[str] = frozenset({"standard"})
     features: frozenset[TransportCapability] = frozenset()
+    maximum_bundle_transactions: int | None = None
 
     def accepts_variant(self, variant: str) -> bool:
         """Return whether the already-signed message variant is accepted."""
@@ -112,6 +114,8 @@ JITO_CAPABILITIES = ProviderCapabilities(
             TransportCapability.JITO,
             TransportCapability.DIRECT_LEADER,
             TransportCapability.SAME_SIGNATURE_COMPATIBLE,
+            TransportCapability.MULTI_TRANSACTION_BUNDLE,
         }
     ),
+    maximum_bundle_transactions=5,
 )

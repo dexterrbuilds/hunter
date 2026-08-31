@@ -9,6 +9,11 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from application.milestone37_config import (
+    validate_token_launch_config,
+    validate_wallet_fleet_config,
+    wallet_tracking_config_from_dict,
+)
 from benchmark.live_config import live_benchmark_config_from_dict
 from interfaces.core import Platform
 from monitoring.performance.config import (
@@ -247,6 +252,16 @@ def validate_config(config: dict) -> None:
                 )
             if not config.get("risk", {}).get("enforce", False):
                 raise ValueError("maximum_performance requires risk.enforce: true")
+
+    wallet_tracking_config_from_dict(config.get("wallet_tracking"))
+    wallet_fleet = config.get("wallet_fleet")
+    validate_wallet_fleet_config(wallet_fleet)
+    validate_token_launch_config(
+        config.get("token_launch"),
+        wallet_fleet_enabled=bool(
+            isinstance(wallet_fleet, dict) and wallet_fleet.get("enabled", False)
+        ),
+    )
 
     # Platform-specific validation
     platform_str = config.get("platform", "pump_fun")

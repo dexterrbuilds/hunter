@@ -304,7 +304,7 @@ class PlatformAwareBuyer(Trader):
         """
         return self.quote_amounts.get(quote_mint)
 
-    async def execute(
+    async def execute(  # noqa: PLR0913
         self,
         token_info: TokenInfo,
         *,
@@ -312,6 +312,8 @@ class PlatformAwareBuyer(Trader):
         existing_last_valid_block_height: int | None = None,
         logical_execution_id: str | None = None,
         submission_recorder: SubmissionRecorder | None = None,
+        intent_source: str = "launch_snipe",
+        execution_urgency: str = "high",
     ) -> TradeResult:
         """Execute buy operation using platform-specific implementations."""
         telemetry: ExecutionTelemetry | None = None
@@ -359,6 +361,8 @@ class PlatformAwareBuyer(Trader):
                 )
                 telemetry.logical_trade_id = logical_execution_id
                 telemetry.apply_detection(detection_for(token_info))
+                telemetry.attributes["intent_source"] = intent_source
+                telemetry.attributes["execution_urgency"] = execution_urgency
             # Get platform-specific implementations
             implementations = get_platform_implementations(
                 token_info.platform, self.client
@@ -1007,6 +1011,8 @@ class PlatformAwareSeller(Trader):
         existing_last_valid_block_height: int | None = None,
         logical_execution_id: str | None = None,
         submission_recorder: SubmissionRecorder | None = None,
+        intent_source: str = "manual_sell",
+        execution_urgency: str = "normal",
     ) -> TradeResult:
         """Execute sell operation using platform-specific implementations.
 
@@ -1081,6 +1087,8 @@ class PlatformAwareSeller(Trader):
                 )
                 telemetry.logical_trade_id = logical_execution_id
                 telemetry.apply_detection(detection_for(token_info))
+                telemetry.attributes["intent_source"] = intent_source
+                telemetry.attributes["execution_urgency"] = execution_urgency
 
             # Get platform-specific implementations
             implementations = get_platform_implementations(

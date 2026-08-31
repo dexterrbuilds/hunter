@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from solders.pubkey import Pubkey
+if TYPE_CHECKING:
+    from solders.pubkey import Pubkey
 
-from domain.amounts import BasisPoints, QuoteAmountRaw, TokenAmountRaw
-from domain.quotes import ExecutionPlan
+    from domain.amounts import BasisPoints, QuoteAmountRaw, TokenAmountRaw
+    from domain.intents import TradeIntent
+    from domain.quotes import ExecutionPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +22,7 @@ class BuyRequest:
     token_decimals: int
     logical_execution_id: str | None = None
     plan: ExecutionPlan | None = None
+    intent: TradeIntent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,3 +34,4 @@ class SellRequest:
     slippage: BasisPoints
     logical_execution_id: str | None = None
     plan: ExecutionPlan | None = None
+    intent: TradeIntent | None = None

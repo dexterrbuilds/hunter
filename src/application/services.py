@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Protocol
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from datetime import UTC, datetime
+from time import monotonic_ns
+from typing import TYPE_CHECKING, Protocol
 
-from application.models import BuyRequest, SellRequest
-from application.positions import PositionService
 from application.risk import RiskContext, RiskService
 from domain.lifecycle import PositionStatus
 from domain.quotes import BuyQuote, ExecutionPlan, ExecutionResult, SellQuote
-from execution.coordinator import ExecutionCoordinator
 from execution.errors import ExecutionError
+
+if TYPE_CHECKING:
+    from application.models import BuyRequest, SellRequest
+    from application.positions import PositionService
+    from execution.coordinator import ExecutionCoordinator
 
 
 class BuyQuoteProvider(Protocol):
@@ -34,7 +40,7 @@ class BuyService:
         risk_service: RiskService,
         risk_context_factory: RiskContextFactory,
         position_service: PositionService,
-    ):
+    ) -> None:
         self.quote_provider = quote_provider
         self.coordinator = coordinator
         self.risk_service = risk_service
@@ -43,10 +49,22 @@ class BuyService:
 
     async def buy(self, request: BuyRequest) -> ExecutionResult:
         quote = await self.quote_provider.quote_buy(request)
+        quote_ready_at = datetime.now(UTC)
+        quote_ready_mono_ns = monotonic_ns()
         plan = request.plan or ExecutionPlan.for_buy(
             quote, logical_execution_id=request.logical_execution_id
         )
+        risk_started_at = datetime.now(UTC)
+        risk_started_mono_ns = monotonic_ns()
         self.risk_service.assess(plan, await self.risk_context_factory(plan))
+        plan = _apply_intent_timing(
+            plan,
+            request.intent,
+            quote_ready_at=quote_ready_at,
+            quote_ready_mono_ns=quote_ready_mono_ns,
+            risk_started_at=risk_started_at,
+            risk_started_mono_ns=risk_started_mono_ns,
+        )
         result = await self.coordinator.execute(plan)
         if result.success:
             self.risk_service.record_trade()
@@ -70,7 +88,7 @@ class SellService:
         risk_service: RiskService,
         risk_context_factory: RiskContextFactory,
         position_service: PositionService,
-    ):
+    ) -> None:
         self.quote_provider = quote_provider
         self.coordinator = coordinator
         self.risk_service = risk_service
@@ -94,10 +112,22 @@ class SellService:
             raise ValueError(f"position cannot be sold from state {status.value}")
 
         quote = await self.quote_provider.quote_sell(request)
+        quote_ready_at = datetime.now(UTC)
+        quote_ready_mono_ns = monotonic_ns()
         plan = request.plan or ExecutionPlan.for_sell(
             quote, logical_execution_id=request.logical_execution_id
         )
+        risk_started_at = datetime.now(UTC)
+        risk_started_mono_ns = monotonic_ns()
         self.risk_service.assess(plan, await self.risk_context_factory(plan))
+        plan = _apply_intent_timing(
+            plan,
+            request.intent,
+            quote_ready_at=quote_ready_at,
+            quote_ready_mono_ns=quote_ready_mono_ns,
+            risk_started_at=risk_started_at,
+            risk_started_mono_ns=risk_started_mono_ns,
+        )
         current = self.position_service.get_position(request.position_id)
         if current.accounting.status == PositionStatus.SELL_FAILED_RETRYABLE:
             self.position_service.store.transition_position(
@@ -133,3 +163,28 @@ class SellService:
         self.position_service.apply_sell_execution(request.position_id, result)
         self.risk_service.record_trade()
         return result
+
+
+def _apply_intent_timing(  # noqa: PLR0913
+    plan: ExecutionPlan,
+    intent: object | None,
+    *,
+    quote_ready_at: datetime,
+    quote_ready_mono_ns: int,
+    risk_started_at: datetime,
+    risk_started_mono_ns: int,
+) -> ExecutionPlan:
+    """Attach source-neutral pipeline timing after risk approval."""
+    return replace(
+        plan,
+        intent_source=(getattr(getattr(intent, "source", None), "value", None)),
+        execution_urgency=(getattr(getattr(intent, "urgency", None), "value", None)),
+        intent_received_at=getattr(intent, "received_at", None),
+        intent_received_mono_ns=getattr(intent, "received_mono_ns", None),
+        quote_ready_at=quote_ready_at,
+        quote_ready_mono_ns=quote_ready_mono_ns,
+        risk_started_at=risk_started_at,
+        risk_started_mono_ns=risk_started_mono_ns,
+        risk_approved_at=datetime.now(UTC),
+        risk_approved_mono_ns=monotonic_ns(),
+    )

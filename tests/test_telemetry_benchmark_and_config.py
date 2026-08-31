@@ -218,7 +218,7 @@ class TelemetryBenchmarkConfigTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             loaded, rows, version = asyncio.run(run(Path(directory) / "hunter.sqlite3"))
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual(loaded["provider_attempts"][0]["provider_id"], "provider")
         self.assertEqual(rows[0]["signature"], "sig")
 

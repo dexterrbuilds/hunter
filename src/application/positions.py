@@ -161,6 +161,15 @@ class PositionService:
             raise KeyError(f"unknown position: {position_id}")
         return position
 
+    def has_open_position(self, wallet_id: str, mint: Pubkey) -> bool:
+        """Return whether the baseline signer has a non-closed mint position."""
+        del wallet_id
+        return any(
+            item.accounting.token_mint == mint
+            and item.accounting.status != PositionStatus.CLOSED
+            for item in self.list_positions()
+        )
+
     def get_realized_pnl(self, position_id: str) -> dict[str, int | None]:
         accounting = self.get_position(position_id).accounting
         return {

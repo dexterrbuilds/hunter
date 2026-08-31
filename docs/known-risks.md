@@ -3,6 +3,62 @@
 Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
 
+## Resolved or materially improved in Milestone 3.7
+
+- A provider-neutral `TradeIntent` carries trigger source and urgency into the
+  same buy/sell preparation and Milestone 3.6 routing stack. Manual, managed,
+  tracked-wallet, and fleet actions do not select a slower provider path.
+- Tracked Pump.fun CREATE and BUY events are decoded independently, claimed
+  durably, and processed through a bounded queue. Failed transactions, sells,
+  and unrelated activity are ignored.
+- Exact fixed and proportional copy sizing fails closed when source amount,
+  quote mint, or decimals are unavailable or inconsistent.
+- Pump.fun launch planning persists ordered create/creator/participant
+  components and their distinct signatures before submission. Jito bundle
+  capacity, one-blockhash use, tip-once rules, and ambiguous recovery are
+  explicit.
+- Launch risk enforcement is mandatory and includes per-wallet, aggregate,
+  fee/tip, reserve, exposure, signer, balance, and bundle-capacity checks.
+- Fleet positions, scheduled exits, and exit identities survive restart.
+  Profit/TP/SL valuation uses expected quote proceeds, while SOL execution costs
+  remain separate for SPL-quoted fleets.
+- Tracked-event, launch, and fleet-exit persistence no longer performs direct
+  SQLite work on their async dispatch hot paths.
+
+## Remaining wallet-tracking and fleet risks
+
+- **The new orchestration services are disabled and not composed into normal
+  startup by default.** They are application boundaries with offline tests, not
+  a production launch command or Telegram feature.
+- **Portable tracked-wallet monitoring uses processed logs.** Milestone 3.6
+  feeds can emit the same normalized observation, but provider-specific wallet
+  subscriptions still need deployment composition and regional measurement.
+- **`aggregate_position` needs application-specific accounting policy.** The
+  enum is explicit, but the current tracked-wallet service delegates actual
+  aggregation to the existing PositionService and risk layer.
+- **A Jito bundle currently holds at most five transactions.** Because create
+  and creator buy are separate components, only three additional launch buys fit
+  the current plan. Provider semantics can change and must be revalidated.
+- **Non-bundled launches may partially land.** Parallel and sequential modes
+  require signature-by-signature reconciliation and must not be treated as
+  atomic.
+- **Bundle acknowledgement is not landing.** Temporary status invisibility,
+  provider outage, or a process crash moves the plan to reconciliation rather
+  than authorizing a replacement.
+- **Launch and fleet execution have not been live validated.** Signer registry,
+  balance reader, authoritative buy factory, bundle provider, and post-landing
+  effect application must be composed and tested with an isolated tiny wallet
+  under explicit authorization.
+- **Fleet exit atomicity can amplify stale-state failure.** One invalid sell can
+  reject an entire bundle; account and inventory prevalidation remains a caller
+  responsibility before signing.
+- **No metadata uploader or treasury distributor is implemented.** Launch
+  metadata must already be hosted, and wallet ownership/funding stays explicit.
+- **The launch builder currently supports SOL-paired create_v2 only.** SPL-quote
+  launches fail closed until the optional quote-account form is characterized.
+- **No cross-asset FX conversion exists.** SOL fees for USDC-quoted fleet trades
+  remain separately denominated, so net quote return may be unknown.
+
 ## Resolved or materially improved in Milestone 3.6
 
 - Multiple creation feeds now converge on one bounded earliest-event aggregator;
@@ -54,9 +110,10 @@ improvements from risks that remain open; it is not exhaustive.
 - **Processed observations are not finalized truth.** A low-latency fork can be
   abandoned. The profile exposes this risk rather than strengthening commitment
   silently.
-- **Economically critical SQLite identity writes remain synchronous.** Removing
-  that boundary would weaken duplicate-trade safety; storage latency should be
-  measured on the production disk.
+- **Economically critical identity durability still gates dispatch.** The new
+  async services move SQLite calls to worker threads, but dispatch deliberately
+  waits for a durable claim/signature identity. Storage latency should be
+  measured on the production disk rather than bypassed.
 
 ## Resolved or materially improved in Milestone 3
 
@@ -124,9 +181,9 @@ improvements from risks that remain open; it is not exhaustive.
 - **Alternate providers are opt-in and unbenchmarked locally.** Shipping an
   adapter does not prove it is faster or more reliable from the operator's
   region. Standard RPC remains the default.
-- **Jito multi-transaction bundles are not implemented.** `bundleOnly` is the
-  documented single-transaction mode; Hunter has not established an atomic
-  multi-transaction Pump.fun requirement.
+- **Jito multi-transaction bundles are limited to launch/fleet orchestration.**
+  Normal one-transaction delivery keeps its existing sender semantics; bundle
+  orchestration has not been live benchmarked or production-proven.
 - **Tip account selection is operator-configured.** Hunter does not fetch Jito
   tip accounts synchronously on the trade hot path. A stale/invalid configured
   account causes provider rejection rather than being guessed.

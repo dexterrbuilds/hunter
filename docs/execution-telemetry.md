@@ -18,6 +18,10 @@ must never be subtracted to measure execution latency.
 | Stage | UTC timestamp | Monotonic timestamp |
 |---|---:|---:|
 | Token detected | `detected_at` | `detected_mono_ns` |
+| Intent received | `intent_received_at` | `intent_received_mono_ns` |
+| Quote ready | `quote_ready_at` | `quote_ready_mono_ns` |
+| Risk start | `risk_started_at` | `risk_started_mono_ns` |
+| Risk approved | `risk_approved_at` | `risk_approved_mono_ns` |
 | Trade requested | `trade_requested_at` | `trade_requested_mono_ns` |
 | Build start | `build_started_at` | `build_started_mono_ns` |
 | Build complete | `build_completed_at` | `build_completed_mono_ns` |
@@ -39,6 +43,7 @@ represent failures during construction, signing, transport, or confirmation.
 - `provider_id`: logical provider/adapter name
 - `endpoint_id`: credential-free endpoint identifier
 - `logical_trade_id` and `execution_variant`
+- trigger-neutral `intent_source` and `execution_urgency`
 - detector source, event/transaction/launch slots, and processing timestamps
 - detector region, creation signature, socket receipt, parser, validation,
   correlation, and logical-claim monotonic timestamps
@@ -86,3 +91,8 @@ Maximum-performance feed, UDP ingress, aggregate-observation, and asynchronous
 telemetry queues are bounded. Their drop counters are operational health
 signals and must be interpreted alongside latency distributions; a low latency
 sample with discarded observations is not a healthy result.
+
+Tracked-wallet event, launch-plan/component, bundle, and fleet-exit lifecycle
+records are stored in their dedicated schema tables. They correlate through
+stable intent/execution/plan IDs and public signatures; signer references and
+authenticated endpoints are never copied into telemetry.

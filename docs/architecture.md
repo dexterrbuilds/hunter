@@ -1,6 +1,7 @@
 # Hunter architecture
 
-Milestone 3 adds measured provider routing around the Milestone 2 domain and
+Milestones 3–3.7 add measured provider routing and intent-neutral orchestration
+around the Milestone 2 domain and
 application boundaries. The audited standard Solana JSON-RPC path remains the
 default when no `execution` section is configured. Pump.fun instruction builders,
 account ordering, discriminators, PDA/ATA derivation, program IDs, and vendored
@@ -12,6 +13,8 @@ IDLs remain the Milestone 1 implementations.
 listeners / future interfaces
             |
       TradingEngine facade
+            |
+         TradeIntent
             |
    BuyService / SellService -------- RiskService
             |                              |
@@ -36,6 +39,28 @@ split. Its active Pump path now uses the same raw quotes, risk checks, execution
 effects, persistence, recovery, logical transaction identity, bounded token
 workers, and bounded position monitors. New interfaces should depend on
 `TradingEngine`, not on `UniversalTrader` or a listener.
+
+## Universal intent boundary
+
+`TradeIntent` records why an economic action exists without deciding how it is
+delivered. Launch snipes, tracked-wallet CREATE and BUY events, manual actions,
+YOLO continuation, TP/SL/time/emergency exits, token-launch components, and
+fleet exits converge on the same buy/sell services and configured execution
+coordinator. Intent ID, source, urgency, source signature/slot, risk timing, and
+quote timing flow into the existing telemetry model.
+
+Tracked-wallet decoding is a bounded monitoring service. Durable event claims
+and SQLite completion updates are adapted through worker threads, while the
+normal exact quote and RiskService remain the economic authority. See
+[wallet-tracking.md](wallet-tracking.md).
+
+Pump.fun launch orchestration is isolated from the existing trading instruction
+builder. A frozen `LaunchExecutionPlan` contains ordered, separately signed
+create and buy components. Jito supplies atomic ordered bundle transport when
+selected and within the advertised five-transaction capability; non-bundle
+modes are explicitly non-atomic. Fleet positions and exit claims share the
+versioned SQLite store. See
+[token-launch-and-wallet-fleet.md](token-launch-and-wallet-fleet.md).
 
 ## Raw amounts and rounding
 
@@ -119,7 +144,9 @@ conversion. Gross quote PnL remains available.
 
 SQLite schema migrations persist position aggregates, fills, lifecycle events,
 logical executions and attempts, telemetry, strategy/recovery metadata, and
-settings. Secrets and endpoint URLs are not stored. WAL mode and a process-local
+settings. Schema version 4 also persists tracked-wallet claims, launch plans,
+ordered launch components, fleet positions, and fleet-exit identities. Secrets
+and endpoint URLs are not stored. WAL mode and a process-local
 lock provide bounded local concurrency.
 
 Startup loads active positions and inspects persisted sell signatures before
@@ -226,3 +253,17 @@ freshness, and signer initialization. A maximum-performance bot cannot enter
 the listener loop when required components are unavailable unless degraded
 operation was explicitly enabled. See
 [max-performance-deployment.md](max-performance-deployment.md).
+
+## Launch and fleet lifecycle
+
+Launch states are `DRAFT`, `VALIDATED`, `PREPARING`, `SIGNED`, `SUBMITTED`,
+`LANDED`, `ACTIVE`, `EXIT_REQUESTED`, `EXIT_SUBMITTED`, `CLOSED`, `FAILED`, and
+`RECONCILIATION_REQUIRED`. Component states retain distinct signatures and
+logical identities. Plan submission acknowledgement never means landed.
+
+Fleet exits freeze stable per-position intent IDs before dispatch. Bundle,
+bounded parallel, and sequential policies are explicit. Pending identities are
+loaded after restart for inspection and are never treated as permission to
+construct replacement sells. Scheduled exit timestamps are persisted in UTC;
+runtime evaluation uses the recovered deadline rather than restarting the
+timer.

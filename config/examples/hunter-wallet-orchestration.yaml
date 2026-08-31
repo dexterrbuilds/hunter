@@ -1,0 +1,48 @@
+# Hunter Milestone 3.7 reference only. Nothing here is enabled or runnable.
+# Copy deliberately into private bot configuration and replace placeholders.
+wallet_tracking:
+  enabled: false
+  duplicate_policy: ignore_existing_position
+  maximum_pending_events: 256
+  decoder_workers: 2
+  wallets:
+    - address: "11111111111111111111111111111111"
+      label: example_wallet
+      watch_create: true
+      watch_buy: true
+      create_action:
+        enabled: false
+        sizing_mode: fixed
+        buy_amount_sol: "0.001"
+        slippage_bps: 100
+      copy_action:
+        enabled: false
+        sizing_mode: fixed
+        buy_amount_sol: "0.001"
+        slippage_bps: 100
+
+wallet_fleet:
+  enabled: false
+  wallets:
+    - id: creator
+      signer: "env:HUNTER_CREATOR_SIGNER"
+    - id: participant_1
+      signer: "env:HUNTER_PARTICIPANT_1_SIGNER"
+  launch:
+    risk_enforced: true
+    maximum_creator_buy_raw: 1000000
+    maximum_additional_wallet_buy_raw: 1000000
+    maximum_aggregate_launch_spend_raw: 2000000
+    maximum_wallet_count: 2
+    maximum_total_priority_fees_lamports: 100000
+    maximum_bundle_tip_lamports: 100000
+    maximum_combined_transaction_cost_lamports: 5000000
+    minimum_wallet_reserve_lamports: 50000000
+    maximum_simultaneous_launch_exposure_raw: 2000000
+
+token_launch:
+  enabled: false
+  execution:
+    mode: bundle # bundle | parallel_fast | sequential
+  exit:
+    type: manual # manual | profit_target | time_based | take_profit | stop_loss

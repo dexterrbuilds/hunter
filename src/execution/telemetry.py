@@ -105,6 +105,16 @@ class ExecutionTelemetry:
     endpoint_id: str | None = None
     logical_trade_id: str | None = None
     execution_variant: str = "standard"
+    intent_source: str | None = None
+    execution_urgency: str | None = None
+    intent_received_at: datetime | None = None
+    intent_received_mono_ns: int | None = None
+    quote_ready_at: datetime | None = None
+    quote_ready_mono_ns: int | None = None
+    risk_started_at: datetime | None = None
+    risk_started_mono_ns: int | None = None
+    risk_approved_at: datetime | None = None
+    risk_approved_mono_ns: int | None = None
 
     detection_source: str | None = None
     detection_source_region: str | None = None

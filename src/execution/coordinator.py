@@ -83,6 +83,16 @@ class ExecutionCoordinator:
                 )
 
         telemetry = ExecutionTelemetry(execution_id=plan.logical_execution_id)
+        telemetry.intent_source = plan.intent_source
+        telemetry.execution_urgency = plan.execution_urgency
+        telemetry.intent_received_at = plan.intent_received_at
+        telemetry.intent_received_mono_ns = plan.intent_received_mono_ns
+        telemetry.quote_ready_at = plan.quote_ready_at
+        telemetry.quote_ready_mono_ns = plan.quote_ready_mono_ns
+        telemetry.risk_started_at = plan.risk_started_at
+        telemetry.risk_started_mono_ns = plan.risk_started_mono_ns
+        telemetry.risk_approved_at = plan.risk_approved_at
+        telemetry.risk_approved_mono_ns = plan.risk_approved_mono_ns
         telemetry.mark("trade_requested")
         submitted = await self.gateway.submit(plan, telemetry)
         self.store.update_execution(

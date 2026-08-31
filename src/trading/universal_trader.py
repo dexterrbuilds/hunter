@@ -29,6 +29,7 @@ from core.pubkeys import (
     resolve_quote_mint,
 )
 from core.wallet import Wallet
+from domain.intents import ExecutionUrgency, TradeIntentSource
 from domain.lifecycle import ExecutionState, PositionStatus, is_retryable
 from domain.quotes import ExecutionSide
 from execution.detection import detection_for
@@ -78,6 +79,14 @@ logger = get_logger(__name__)
 # where the price is re-read first. Bounded so a token that keeps reverting
 # cannot pin the bot on one position forever.
 DEFAULT_MAX_EXIT_SELL_ATTEMPTS = 3
+
+
+def _intent_source_value(
+    source: TradeIntentSource | str | None, fallback: TradeIntentSource
+) -> str:
+    """Normalize an observability label without affecting execution routing."""
+    selected = source or fallback
+    return selected.value if isinstance(selected, TradeIntentSource) else str(selected)
 
 
 def _resolve_quote_config(
@@ -985,6 +994,8 @@ class UniversalTrader:
         token_info: TokenInfo,
         *,
         logical_execution_id: str | None = None,
+        intent_source: TradeIntentSource | str | None = None,
+        execution_urgency: ExecutionUrgency = ExecutionUrgency.HIGH,
     ) -> TradeResult:
         """Persist logical buy identity before waiting for confirmation."""
         if not hasattr(self, "position_store"):
@@ -1014,6 +1025,15 @@ class UniversalTrader:
             existing_last_valid_block_height=execution.last_valid_block_height,
             logical_execution_id=logical_execution_id,
             submission_recorder=record_submission,
+            intent_source=_intent_source_value(
+                intent_source,
+                (
+                    TradeIntentSource.YOLO
+                    if getattr(self, "yolo_mode", False)
+                    else TradeIntentSource.LAUNCH_SNIPE
+                ),
+            ),
+            execution_urgency=execution_urgency.value,
         )
         if result.success:
             self.position_store.update_execution(
@@ -1213,6 +1233,8 @@ class UniversalTrader:
                 token_info,
                 token_amount=buy_result.amount,
                 token_price=buy_result.price,
+                intent_source=TradeIntentSource.TIMED_EXIT,
+                execution_urgency=ExecutionUrgency.HIGH,
             )
 
             if sell_result.success:
@@ -1290,6 +1312,18 @@ class UniversalTrader:
                         token_info,
                         token_amount=position.quantity,
                         token_price=current_price,
+                        intent_source=(
+                            TradeIntentSource.TAKE_PROFIT
+                            if exit_reason.value == "take_profit"
+                            else TradeIntentSource.STOP_LOSS
+                            if exit_reason.value == "stop_loss"
+                            else TradeIntentSource.TIMED_EXIT
+                        ),
+                        execution_urgency=(
+                            ExecutionUrgency.CRITICAL
+                            if exit_reason.value == "stop_loss"
+                            else ExecutionUrgency.HIGH
+                        ),
                     )
 
                     if sell_result.success:
@@ -1375,20 +1409,24 @@ class UniversalTrader:
                     self.price_check_interval
                 )  # Continue monitoring despite errors
 
-    async def _execute_managed_sell(
+    async def _execute_managed_sell(  # noqa: PLR0913
         self,
         token_info: TokenInfo,
         *,
         token_amount: float,
         token_price: float,
         logical_execution_id: str | None = None,
+        intent_source: TradeIntentSource | str = TradeIntentSource.MANUAL_SELL,
+        execution_urgency: ExecutionUrgency = ExecutionUrgency.NORMAL,
     ) -> TradeResult:
         """Persist sell lifecycle and inspect ambiguous signatures before retry."""
         if not hasattr(self, "active_position_ids"):
             # Offline Milestone 1 verification harnesses construct a minimal
             # coordinator without persistence; preserve their call contract.
             return await self.seller.execute(
-                token_info, token_amount=token_amount, token_price=token_price
+                token_info,
+                token_amount=token_amount,
+                token_price=token_price,
             )
         mint_key = str(token_info.mint)
         position_id = self.active_position_ids.get(mint_key)
@@ -1457,6 +1495,12 @@ class UniversalTrader:
             ),
             logical_execution_id=logical_execution_id,
             submission_recorder=(record_submission if position_id else None),
+            intent_source=(
+                intent_source.value
+                if isinstance(intent_source, TradeIntentSource)
+                else str(intent_source)
+            ),
+            execution_urgency=execution_urgency.value,
         )
         if result.tx_signature:
             self.pending_sell_signatures[mint_key] = str(result.tx_signature)

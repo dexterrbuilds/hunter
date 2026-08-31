@@ -336,6 +336,16 @@ class ExecutionPlan:
     limit_output_raw: int
     quote: BuyQuote | SellQuote
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    intent_source: str | None = None
+    execution_urgency: str | None = None
+    intent_received_at: datetime | None = None
+    intent_received_mono_ns: int | None = None
+    quote_ready_at: datetime | None = None
+    quote_ready_mono_ns: int | None = None
+    risk_started_at: datetime | None = None
+    risk_started_mono_ns: int | None = None
+    risk_approved_at: datetime | None = None
+    risk_approved_mono_ns: int | None = None
 
     @classmethod
     def for_buy(
