@@ -474,6 +474,11 @@ class HunterApplication:
         managed_exit: bool = False,
     ) -> None:
         """Gate exposure changes at the final application execution boundary."""
+        if "deployment" in self.config:
+            raise ExecutionError(
+                ErrorClassification.RISK_LIMIT_EXCEEDED,
+                "deployment shadow mode forbids all economic actions",
+            )
         classification = classify_economic_action(source, action)
         if not self.recovery_complete:
             raise ExecutionError(
@@ -533,6 +538,8 @@ class HunterApplication:
 
     def enable_trading(self) -> None:
         """Enable entries only when runtime and configured RiskService permit it."""
+        if "deployment" in self.config:
+            raise ValueError("deployment shadow mode cannot enable trading")
         if self.kill_switch:
             raise ValueError("cannot enable trading while kill switch is active")
         if not self.recovery_complete:
@@ -836,9 +843,13 @@ class HunterApplication:
             trading_enabled=self.trading_enabled,
             kill_switch=self.kill_switch,
             entries_allowed=(
-                application_ready and self.trading_enabled and not self.kill_switch
+                application_ready
+                and self.trading_enabled
+                and not self.kill_switch
+                and "deployment" not in self.config
             ),
-            defensive_exits_allowed=application_ready,
+            defensive_exits_allowed=application_ready
+            and "deployment" not in self.config,
             recovery_complete=self.recovery_complete,
             database_ready=self.state
             not in {ApplicationState.CREATED, ApplicationState.FAILED},

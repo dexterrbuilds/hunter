@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 hunter = "bot_runner:main"
+hunter-ops = "operations.cli:main"
 hunter-benchmark-report = "benchmark.report:main"
 hunter-benchmark-live = "benchmark.cli:live_main"
 hunter-benchmark-detection = "benchmark.cli:detection_main"

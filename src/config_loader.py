@@ -20,6 +20,7 @@ from monitoring.performance.config import (
     InfrastructureProfile,
     infrastructure_config_from_dict,
 )
+from operations.config import require, resolve_deployment_env, validate_deployment
 from telegram_control.config import telegram_config_from_dict
 from terminal_ui.config import terminal_ui_config_from_dict
 from utils.redaction import register_config_secrets
@@ -112,6 +113,12 @@ def load_bot_config(path: str) -> dict:
     with config_path.open() as f:
         config = yaml.safe_load(f)
 
+    require(isinstance(config, dict), "configuration (must be a mapping)")
+    require(
+        "deployment" not in config or not config.get("env_file"),
+        "deployment uses service environment; omit env_file",
+    )
+
     env_file = config.get("env_file")
     if env_file:
         config_path = Path(path)
@@ -134,6 +141,9 @@ def load_bot_config(path: str) -> dict:
 
 def resolve_env_vars(config: dict) -> None:
     """Recursively resolve environment variables in the configuration."""
+    if "deployment" in config:
+        resolve_deployment_env(config)
+        return
 
     def resolve_env(value):
         if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
@@ -167,6 +177,9 @@ def get_nested_value(config: dict, path: str) -> Any:
 
 def validate_config(config: dict) -> None:
     """Validate the configuration against defined rules with platform support."""
+    if "deployment" in config:
+        validate_deployment(config)
+        return
     # Validate required fields
     for field in REQUIRED_FIELDS:
         get_nested_value(config, field)

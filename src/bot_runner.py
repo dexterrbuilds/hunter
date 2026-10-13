@@ -118,6 +118,12 @@ def setup_logging(bot_name: str):
 async def start_bot(config_path: str):
     """Start a trading bot with the configuration from the specified path."""
     cfg = load_bot_config(config_path)
+    if "deployment" in cfg:
+        # Import only when the optional deployment path is selected.
+        from operations.shadow import run_shadow  # noqa: PLC0415
+
+        await run_shadow(cfg)
+        return
     setup_logging(cfg["name"])
     print_config_summary(cfg)
 

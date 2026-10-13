@@ -1,0 +1,27 @@
+# M6 deployment profile: passive ingestion only. No wallet or trading database.
+name: hunter-amsterdam
+platform: pump_fun
+deployment:
+  environment: production
+  mode: shadow
+  live_trading_opt_in: false
+  region_label: amsterdam
+  queue_size: 1024
+  stale_after_seconds: 120
+  report_interval_seconds: 30
+  shutdown_timeout_seconds: 10
+  minimum_free_bytes: 100000000
+risk:
+  enforce: true
+  trading_enabled: false
+storage:
+  shadow_database_path: /var/lib/hunter/shadow/observations.sqlite3
+filters:
+  listener_type: logs
+wss_endpoint: ${SOLANA_NODE_WSS_ENDPOINT}
+telegram:
+  enabled: false
+terminal_ui:
+  enabled: false
+cleanup:
+  mode: disabled

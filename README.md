@@ -77,9 +77,16 @@ every other trigger.
 | Runtime composition | Recovery barrier, infrastructure warm-up, readiness/degraded states, feature gates, bounded events, task supervision, concurrent bot instances, and graceful shutdown |
 | Private Telegram control | Optional numeric-owner/private-chat commands, staged economic confirmation, runtime controls, managed trades, status, and non-blocking notifications |
 | Terminal operator interface | Optional local Textual dashboard, bounded status/history views, confirmed runtime controls, and read-only trading inspection |
+| Amsterdam deployment preparation | Linux systemd template, offline preflight, private operational SQLite storage and restricted non-trading shadow ingestion; host deployment remains manual |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
+
+For the passive Linux deployment profile, see [Amsterdam deployment](docs/deployment-amsterdam.md)
+and [its configuration](config/examples/hunter-amsterdam.yaml). Run
+`python -m operations.cli preflight CONFIG` before explicitly starting shadow
+ingestion. This profile has no wallet or trading engine and rejects live mode.
+No Amsterdam host or provider connectivity has been validated by offline tests.
 
 The normal Pump.fun path reads current curve and fee state, calculates expected
 output using raw integer reserves, applies protocol and creator fees using the

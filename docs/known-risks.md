@@ -3,6 +3,24 @@
 Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
 
+## Milestone 6 deployment preparation
+
+- A restricted production profile and systemd service now support passive logs,
+  blocks and PumpPortal ingestion without a wallet or economic execution stack.
+- Disposable preflight writes do not touch trading data; observation storage
+  validates identity/version, uses private permissions and refuses corrupt data.
+- The application authorization boundary rejects economic actions for deployment
+  profiles even if an application is constructed outside the passive entrypoint.
+- **Remaining:** the Amsterdam host, Linux unit, real feed connectivity and native
+  wheel installation are unverified. Live deployment is unsupported by this profile.
+- **Remaining:** shadow Geyser/aggregate feeds, typed legacy connection/reconnect
+  status, strategy decisions and live cache diagnostics are not integrated. Unknown
+  status is explicit. Shadow observations are not simulated or real executions.
+- **Remaining:** observation retention and host journal limits require operations
+  policy. Queued observations can be lost on forced termination; SQLite writes can
+  still fail after a successful disk-space check. Native I/O shutdown ultimately
+  relies on systemd's hard timeout. See [deployment guide](deployment-amsterdam.md).
+
 ## Resolved or materially improved in Milestone 5
 
 - The optional local terminal dashboard reads typed application state through a
