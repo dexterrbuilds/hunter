@@ -51,7 +51,14 @@ temp/
 # Editors and local agent settings
 .vscode/
 .idea/
-.claude/settings.local.json
+.claude/
+.codex/
+.cursor/
+.windsurf/
+/.agents/
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.local.md
 .pylintrc
 .DS_Store
 
