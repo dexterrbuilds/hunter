@@ -3,6 +3,32 @@
 Hunter remains pre-production software. This list distinguishes implemented
 improvements from risks that remain open; it is not exhaustive.
 
+## Resolved or materially improved in Milestone 5
+
+- The optional local terminal dashboard reads typed application state through a
+  bounded adapter and does not introduce provider, signer, transaction, or
+  submission access.
+- Terminal events and refresh requests are bounded and non-blocking; UI startup,
+  rendering failure, and exit do not own or gate Hunter's trading lifecycle.
+- Enable, disable, and kill-switch controls require an explicit modal and final
+  state revalidation. Unsupported kill-switch clearing fails closed.
+- Missing PnL and latency data remains explicitly unavailable or unmeasured
+  instead of being displayed as zero.
+
+## Remaining terminal-interface risks
+
+- **A local terminal is a privileged surface.** Secure the host and any SSH
+  session. The TUI adds no separate identity or role layer.
+- **Kill-switch clearing remains unavailable.** Hunter has no safe application
+  API for it, so the TUI cannot clear the switch by mutating internal state.
+- **Live valuation is intentionally absent.** The TUI does not add per-position
+  RPC/price reads, so unrealized PnL and current value remain unavailable.
+- **Some orchestration history lacks bounded application queries.** Launch and
+  fleet screens report capability/state but do not bypass the application to
+  enumerate internal storage.
+- **The TUI is offline-tested.** It has not been operated against a funded live
+  deployment and is not evidence that Hunter is production-ready.
+
 ## Resolved or materially improved in Milestone 4
 
 - Optional Telegram control authenticates numeric owner IDs before command

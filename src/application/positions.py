@@ -155,6 +155,12 @@ class PositionService:
     def list_positions(self) -> list[StoredPosition]:
         return self.store.list_positions()
 
+    def list_positions_page(
+        self, *, limit: int = 25, offset: int = 0
+    ) -> list[StoredPosition]:
+        """Return one bounded page without loading the full position history."""
+        return self.store.list_positions_page(limit=limit, offset=offset)
+
     def get_position(self, position_id: str) -> StoredPosition:
         position = self.store.get_position(position_id)
         if position is None:

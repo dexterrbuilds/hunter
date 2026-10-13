@@ -21,6 +21,7 @@ from monitoring.performance.config import (
     infrastructure_config_from_dict,
 )
 from telegram_control.config import telegram_config_from_dict
+from terminal_ui.config import terminal_ui_config_from_dict
 from utils.redaction import register_config_secrets
 
 # Existing validation rules (keeping all existing ones)
@@ -264,6 +265,7 @@ def validate_config(config: dict) -> None:
         ),
     )
     telegram_config_from_dict(config.get("telegram"))
+    terminal_ui_config_from_dict(config.get("terminal_ui"))
 
     # Platform-specific validation
     platform_str = config.get("platform", "pump_fun")

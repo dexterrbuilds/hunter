@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 SCHEMA_VERSION = 4
 _MAX_EXECUTION_LIST_LIMIT = 200
+_MAX_POSITION_PAGE_LIMIT = 100
+_MAX_TELEMETRY_LIST_LIMIT = 1000
 
 
 @dataclass(slots=True)
@@ -463,6 +465,29 @@ class SQLitePositionStore:
                 ).fetchall()
         return [_row_to_position(row) for row in rows]
 
+    def list_positions_page(
+        self, *, limit: int = 25, offset: int = 0
+    ) -> list[StoredPosition]:
+        """Return one bounded newest-first page for operator interfaces."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_POSITION_PAGE_LIMIT
+        ):
+            raise ValueError(  # noqa: TRY003
+                "position page limit must be between 1 and 100"
+            )
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError(  # noqa: TRY003
+                "position page offset must be non-negative"
+            )
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM positions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [_row_to_position(row) for row in rows]
+
     def transition_position(
         self, position_id: str, target: PositionStatus, reason: str
     ) -> StoredPosition:
@@ -783,6 +808,24 @@ class SQLitePositionStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT payload_json FROM execution_telemetry ORDER BY created_at"
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def list_recent_telemetry(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Return a bounded newest-first telemetry window for operator views."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_TELEMETRY_LIST_LIMIT
+        ):
+            raise ValueError(  # noqa: TRY003
+                "telemetry list limit must be between 1 and 1000"
+            )
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM execution_telemetry "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 

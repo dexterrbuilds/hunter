@@ -1,0 +1,14 @@
+# Safe local terminal interface example. Merge this block into one bot YAML.
+# It opens no network listener and requires no additional credentials.
+terminal_ui:
+  enabled: false
+  refresh_interval_seconds: 1.0
+  balance_refresh_seconds: 30.0
+  startup_timeout_seconds: 5.0
+  shutdown_timeout_seconds: 3.0
+  event_queue_size: 256
+  event_history_size: 100
+  position_page_size: 25
+  execution_page_size: 50
+  telemetry_sample_size: 200
+  stale_after_seconds: 60.0

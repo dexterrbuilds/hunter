@@ -33,6 +33,7 @@ from config_loader import (
 )
 from core.pubkeys import resolve_quote_mint
 from telegram_control.factory import telegram_control_factories_from_config
+from terminal_ui.factory import terminal_ui_factories_from_config
 from trading.universal_trader import (
     DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
     UniversalTrader,
@@ -250,7 +251,10 @@ async def start_bot(config_path: str):
             infrastructure_config=cfg.get("infrastructure"),
         )
 
-        control_factories = telegram_control_factories_from_config(cfg.get("telegram"))
+        control_factories = (
+            *telegram_control_factories_from_config(cfg.get("telegram")),
+            *terminal_ui_factories_from_config(cfg.get("terminal_ui")),
+        )
         application = HunterApplication(
             cfg,
             trader,
@@ -271,7 +275,7 @@ def run_bot_process(config_path):
     asyncio.run(start_bot(config_path))
 
 
-def run_all_bots():  # noqa: C901, PLR0915
+def run_all_bots():  # noqa: C901, PLR0912, PLR0915
     """Run all bots defined in YAML files in the 'bots' directory."""
     bot_dir = Path("bots")
     if not bot_dir.exists():
@@ -287,6 +291,7 @@ def run_all_bots():  # noqa: C901, PLR0915
 
     processes = []
     local_configs: list[str] = []
+    local_terminal_ui_configured = False
     skipped_bots = 0
 
     for file in bot_files:
@@ -344,6 +349,19 @@ def run_all_bots():  # noqa: C901, PLR0915
                 p.start()
                 processes.append(p)
             else:
+                terminal_enabled = bool(
+                    isinstance(cfg.get("terminal_ui"), dict)
+                    and cfg["terminal_ui"].get("enabled", False)
+                )
+                if terminal_enabled and local_terminal_ui_configured:
+                    logging.error(
+                        "Only one full-screen terminal UI can run in a shared "
+                        "process; use separate_process for bot '%s'",
+                        bot_name,
+                    )
+                    skipped_bots += 1
+                    continue
+                local_terminal_ui_configured |= terminal_enabled
                 logging.info(
                     f"Starting bot '{bot_name}' ({platform.value}) in main process"
                 )

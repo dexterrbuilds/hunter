@@ -76,6 +76,7 @@ every other trigger.
 | Launch/fleet foundation | Pump.fun `create_v2`, ordered creator/participant buy plans, Jito bundle transport, fleet accounting and coordinated exits; disabled by default |
 | Runtime composition | Recovery barrier, infrastructure warm-up, readiness/degraded states, feature gates, bounded events, task supervision, concurrent bot instances, and graceful shutdown |
 | Private Telegram control | Optional numeric-owner/private-chat commands, staged economic confirmation, runtime controls, managed trades, status, and non-blocking notifications |
+| Terminal operator interface | Optional local Textual dashboard, bounded status/history views, confirmed runtime controls, and read-only trading inspection |
 | Testing | Credential-free offline unit, protocol characterization, transaction construction, recovery, and routing tests |
 
 ### Pump.fun behavior
@@ -161,7 +162,10 @@ execution, and disabled Telegram creates no client.
 See [Runtime composition](docs/runtime.md),
 [Runtime lifecycle](docs/runtime-lifecycle.md), and
 [Production readiness](docs/production-readiness.md). Telegram setup and command
-semantics are documented in [Private Telegram control](docs/telegram.md).
+semantics are documented in [Private Telegram control](docs/telegram.md). The
+optional [Terminal operator interface](docs/terminal-ui.md) uses the same typed
+status and control boundary, creates no network listener, and is disabled by
+default.
 
 For the opt-in Amsterdam-oriented infrastructure profile, see
 [Maximum-performance deployment](docs/max-performance-deployment.md). The safe
@@ -198,6 +202,7 @@ src/platforms/        Pump.fun and LetsBonk protocol implementations
 src/storage/          SQLite schema, migrations, and repositories
 src/strategies/       exit decisions without transaction submission ownership
 src/telegram_control/ private-owner commands, confirmations, and notifications
+src/terminal_ui/      local dashboard, bounded snapshots, confirmed controls
 src/trading/          current compatibility coordinator and trade services
 tests/                fully offline test suite
 ```
@@ -401,6 +406,27 @@ Detection workers and position monitors are bounded independently. A held
 position does not monopolize the global token queue, and duplicate mint events
 are claimed before a logical buy is created.
 
+### Terminal operator interface
+
+The local Textual dashboard is optional and disabled by default:
+
+```yaml
+terminal_ui:
+  enabled: false
+  refresh_interval_seconds: 1.0
+  balance_refresh_seconds: 30.0
+  event_queue_size: 256
+  position_page_size: 25
+  execution_page_size: 50
+```
+
+When enabled for one bot, it starts after recovery and infrastructure warm-up.
+It provides read-only trading inspection plus confirmed enable, disable, and
+kill-switch controls. Closing it does not stop Hunter. It opens no network
+listener and requires no credential. See
+[Terminal operator interface](docs/terminal-ui.md) and the disabled
+[example configuration](config/examples/hunter-terminal-ui.yaml).
+
 ### Execution providers
 
 Provider routing is optional. This minimal example races the same signed
@@ -484,7 +510,7 @@ and the `--allow-live` flag. See [Controlled live benchmark](docs/live-benchmark
 
 To keep the project honest, these are not current features:
 
-- Web UI, public API, or interactive CLI trading
+- Web UI, public API, or terminal-based manual trading
 - Free-form Telegram launch construction; launch submission requires the
   existing deployment-supplied typed launch resolver and orchestration services
 - Automatic token-selection strategies beyond the existing filters
@@ -511,8 +537,8 @@ To keep the project honest, these are not current features:
 
 - Strategy-managed take profit, stop loss, trailing stop, and filters backed by
   persisted positions—not chat state.
-- Additional interfaces such as a local CLI, web dashboard, or private API that
-  call the same trading engine.
+- Additional interfaces such as a web dashboard or private API that call the
+  same trading engine.
 - Expand tracked-wallet venue coverage and policy controls only after execution
   idempotency, risk, and reconciliation have been proven under real conditions.
 
@@ -539,6 +565,7 @@ measurements from the intended deployment environment.
 | [Runtime composition](docs/runtime.md) | Dependency ownership, feature gates, tracked wallets, control and events |
 | [Runtime lifecycle](docs/runtime-lifecycle.md) | Recovery barrier, readiness, task failure, reconnect, shutdown |
 | [Private Telegram control](docs/telegram.md) | Owner security, commands, confirmations, notifications, lifecycle |
+| [Terminal operator interface](docs/terminal-ui.md) | Local dashboard, navigation, safe controls, data limits, and troubleshooting |
 | [Production readiness](docs/production-readiness.md) | Implemented/offline-tested/runtime-composed versus live-validated status |
 | [Execution interfaces](docs/execution-interfaces.md) | Account, blockhash, builder, signer, submitter, confirmation contracts |
 | [Execution providers](docs/execution-providers.md) | Standard RPC, Helius, Jito, routing, identity, connection reuse |

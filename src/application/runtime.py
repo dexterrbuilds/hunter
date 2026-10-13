@@ -555,6 +555,12 @@ class HunterApplication:
     def list_positions(self) -> list[object]:
         return list(self.trader.position_service.list_positions())
 
+    def list_positions_page(self, *, limit: int = 25, offset: int = 0) -> list[object]:
+        """Return bounded persisted position history for operator interfaces."""
+        return list(
+            self.trader.position_service.list_positions_page(limit=limit, offset=offset)
+        )
+
     def get_position(self, position_id: str) -> object:
         return self.trader.position_service.get_position(position_id)
 
@@ -563,6 +569,10 @@ class HunterApplication:
 
     def list_executions(self, limit: int = 20) -> list[object]:
         return list(self.trader.position_store.list_executions(limit))
+
+    def list_recent_telemetry(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Return bounded credential-safe telemetry through the application API."""
+        return list(self.trader.position_store.list_recent_telemetry(limit))
 
     def get_execution(self, identity: str) -> object:
         execution = self.trader.position_store.get_execution(identity)
@@ -574,6 +584,22 @@ class HunterApplication:
 
     def get_settings(self) -> dict[str, Any]:
         return dict(self.trader.position_store.get_settings())
+
+    def operator_settings(self) -> dict[str, Any]:
+        """Return an allowlisted non-secret runtime configuration summary."""
+        trade = self.config.get("trade") or {}
+        filters = self.config.get("filters") or {}
+        execution = self.config.get("execution") or {}
+        return {
+            "platform": self.config.get("platform", "pump_fun"),
+            "listener_type": filters.get("listener_type", "unavailable"),
+            "buy_slippage": trade.get("buy_slippage"),
+            "sell_slippage": trade.get("sell_slippage"),
+            "exit_strategy": trade.get("exit_strategy"),
+            "execution_mode": execution.get(
+                "mode", execution.get("routing_mode", "standard_rpc")
+            ),
+        }
 
     def risk_settings(self) -> dict[str, Any]:
         limits = self.trader.risk_service.limits

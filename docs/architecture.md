@@ -34,7 +34,11 @@ strategies -> exit decisions -> SellService
 positions <-> PositionService <-> SQLitePositionStore
 ```
 
-`HunterApplication` is the normal startup composition root. `UniversalTrader`
+`HunterApplication` is the normal startup composition root. Optional Telegram
+and terminal adapters consume its typed status, bounded read, event, and control
+APIs; neither is imported by the trading engine. The terminal service performs
+bounded/coalesced refreshes outside its renderer and never imports provider,
+signer, transaction, or submission implementations. `UniversalTrader`
 remains a compatibility coordinator during the incremental split, but startup
 is now exposed as recovery, warm-up, service activation, detection, and
 shutdown phases owned by the application lifecycle. Its active Pump path uses

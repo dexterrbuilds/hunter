@@ -174,6 +174,30 @@ class PersistenceRecoveryTests(unittest.TestCase):
         self.assertEqual(loaded.acquired_quantity_raw, maximum)
         self.assertEqual(loaded.remaining_cost_basis_raw, maximum)
 
+    def test_position_pages_are_bounded_and_offset(self):
+        for index in range(4):
+            accounting = PositionAccounting(f"page-{index}", TOKEN, WSOL_MINT, 6, 9)
+            self.store.save_position(StoredPosition(accounting, {}))
+        first = self.store.list_positions_page(limit=2, offset=0)
+        second = self.store.list_positions_page(limit=2, offset=2)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(
+            {item.accounting.position_id for item in (*first, *second)},
+            {f"page-{index}" for index in range(4)},
+        )
+        with self.assertRaises(ValueError):
+            self.store.list_positions_page(limit=101)
+
+    def test_recent_telemetry_query_is_bounded_newest_first(self):
+        for index in range(3):
+            self.store.save_telemetry(ExecutionTelemetry(f"telemetry-{index}"), 1)
+        rows = self.store.list_recent_telemetry(2)
+        self.assertEqual(
+            [item["execution_id"] for item in rows],
+            ["telemetry-2", "telemetry-1"],
+        )
+
     def test_lifecycle_transitions_are_persisted(self):
         self.service.open_from_execution(
             buy_result(),
