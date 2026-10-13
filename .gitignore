@@ -59,6 +59,7 @@ temp/
 /AGENTS.md
 /CLAUDE.md
 /CLAUDE.local.md
+/UPSTREAM.md
 .pylintrc
 .DS_Store
 
